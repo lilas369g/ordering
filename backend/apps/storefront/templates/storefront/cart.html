@@ -1,0 +1,45 @@
+{% load storefront_extras %}
+{% extends "storefront/base.html" %}
+{% block title %}السلة{% endblock %}
+{% block content %}
+  <h1>سلة المشتريات</h1>
+  <p class="muted">هذه السلة مؤقتة ومخزنة في قاعدة البيانات على حساب الجلسة الحالية إلى أن يتم تحويلها لاحقًا إلى order فعلي.</p>
+  {% if items %}
+    <table class="cart-table">
+      <thead>
+        <tr>
+          <th>المنتج</th>
+          <th>SKU</th>
+          <th>السعر</th>
+          <th>المتوفر</th>
+          <th>الكمية</th>
+          <th>المجموع</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in items %}
+          <tr>
+            <td>{{ item.variant.product.name }}</td>
+            <td>{{ item.variant.sku }}</td>
+            <td>{{ item.unit_price_snapshot }} ل.س</td>
+            <td>{{ item.variant.inventory_record.quantity_available|default:0 }}</td>
+            <td>
+              <form method="post" action="{% url 'storefront:update-cart-item' item.id %}" class="flex">
+                {% csrf_token %}
+                <input type="number" name="quantity" value="{{ item.quantity }}" min="0" max="{{ item.variant.inventory_record.quantity_available|default:0 }}">
+                <button type="submit">تحديث</button>
+              </form>
+            </td>
+            <td>{{ item.quantity|floatformat:0 }} × {{ item.unit_price_snapshot }} = {{ item.quantity|mul:item.unit_price_snapshot }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <div class="card" style="margin-top:16px;">
+      <strong>الإجمالي: {{ total }} ل.س</strong>
+      <p class="muted" style="margin-bottom:0;">الخطوة التالية ستكون تحويل السلة إلى order وتثبيت الكميات transactionally أثناء checkout.</p>
+    </div>
+  {% else %}
+    <div class="card">السلة فارغة حاليًا.</div>
+  {% endif %}
+{% endblock %}

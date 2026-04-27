@@ -1,0 +1,39 @@
+{% extends "storefront/base.html" %}
+{% block title %}المنتجات{% endblock %}
+{% block content %}
+  <div style="display:flex; justify-content:space-between; align-items:end; margin-bottom:20px;">
+    <div>
+      <h1 style="margin:0 0 8px 0;">منتجات المتجر</h1>
+      <p class="muted" style="margin:0;">واجهة تجريبية سريعة من Django تعرض المنتجات الموجودة بالمخزون وتضيفها إلى سلة مؤقتة محفوظة في قاعدة البيانات.</p>
+    </div>
+  </div>
+  <div class="grid">
+    {% for product in products %}
+      <section class="card">
+        <span class="badge">{{ product.category.name }} — {{ product.brand.name }}</span>
+        <h3 style="margin:0 0 8px 0;">{{ product.name }}</h3>
+        <p class="muted">{{ product.description|default:"لا يوجد وصف بعد" }}</p>
+        {% for variant in product.variants.all %}
+          <div style="border-top:1px solid #eee; padding-top:12px; margin-top:12px;">
+            <div class="flex" style="justify-content:space-between;">
+              <strong>{{ variant.sku }}</strong>
+              <span>{{ variant.price }} ل.س</span>
+            </div>
+            <p class="muted" style="margin:8px 0;">المتوفر: {{ variant.inventory_record.quantity_available|default:0 }}</p>
+            <form method="post" action="{% url 'storefront:add-to-cart' %}" class="flex">
+              {% csrf_token %}
+              <input type="hidden" name="variant_id" value="{{ variant.id }}">
+              <input type="hidden" name="next" value="{{ request.path }}">
+              <input type="number" name="quantity" value="1" min="1" max="{{ variant.inventory_record.quantity_available|default:0 }}">
+              <button type="submit" {% if not variant.inventory_record or variant.inventory_record.quantity_available < 1 %}disabled{% endif %}>أضف إلى السلة</button>
+            </form>
+          </div>
+        {% empty %}
+          <p class="muted">لا يوجد variants مفعلة لهذا المنتج.</p>
+        {% endfor %}
+      </section>
+    {% empty %}
+      <div class="card">لا يوجد منتجات بعد. شغّلي أمر seed_demo_store أولًا.</div>
+    {% endfor %}
+  </div>
+{% endblock %}
