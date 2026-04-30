@@ -24,29 +24,21 @@ class Command(BaseCommand):
     initial_stock = 1
     worker_count = 2
 
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--verbose-steps",
+            action="store_true",
+            help="Print low-level worker and stock operation logs.",
+        )
+
     def handle(self, *args, **options):
         self.log_id = f"CHECKOUT-RACE-{uuid4().hex[:8].upper()}"
+        self.verbose_steps = options["verbose_steps"]
         metrics = []
 
-        self.stdout.write(f"\n1. BEFORE (problem): log_id={self.log_id}-BEFORE")
-        self.stdout.write(
-            "Scenario: initial_stock=1, parallel_checkouts=2, quantity_per_checkout=1"
-        )
-        self.stdout.write("Method: UNSAFE_READ_THEN_WRITE")
+        self.print_main_header()
         metrics.append(self.run_strategy("UNSAFE", self.unsafe_checkout))
-
-        self.stdout.write(f"\n2. AFTER (solution A): log_id={self.log_id}-AFTER-A")
-        self.stdout.write(
-            "Same scenario -> better result"
-        )
-        self.stdout.write("Method: ROW_LOCK_SELECT_FOR_UPDATE")
         metrics.append(self.run_strategy("ROW_LOCK", self.row_lock_checkout))
-
-        self.stdout.write(f"\n2. AFTER (solution B): log_id={self.log_id}-AFTER-B")
-        self.stdout.write(
-            "Same scenario -> better result"
-        )
-        self.stdout.write("Method: ATOMIC_CONDITIONAL_UPDATE")
         metrics.append(self.run_strategy("CONDITIONAL_UPDATE", self.conditional_update_checkout))
 
         self.print_comparison(metrics)
@@ -64,15 +56,14 @@ class Command(BaseCommand):
             close_old_connections()
             worker_started_at = perf_counter()
             try:
-                self.stdout.write(f"[{prefix}][{label}] ready")
+                if getattr(self, "verbose_steps", False):
+                    self.stdout.write(f"[{prefix}][{label}] ready")
                 start_barrier.wait(timeout=10)
                 order_id = checkout_func(user, label)
                 elapsed_ms = self.elapsed_ms(worker_started_at)
-                self.stdout.write(f"[{prefix}][{label}] SUCCESS order_id={order_id} duration_ms={elapsed_ms}")
                 results.append((label, "SUCCESS", order_id, elapsed_ms))
             except Exception as exc:
                 elapsed_ms = self.elapsed_ms(worker_started_at)
-                self.stdout.write(f"[{prefix}][{label}] FAILED reason={exc} duration_ms={elapsed_ms}")
                 results.append((label, "FAILED", str(exc), elapsed_ms))
                 errors.append(exc)
             finally:
@@ -89,7 +80,7 @@ class Command(BaseCommand):
 
         duration_ms = self.elapsed_ms(started_at)
         metric = self.build_metric(prefix, variant, results, errors, duration_ms)
-        self.print_strategy_summary(metric)
+        self.print_strategy_report(metric)
         return metric
 
     @transaction.atomic
@@ -101,9 +92,10 @@ class Command(BaseCommand):
         item = CartItem.objects.select_related("variant").get(cart=cart)
         inventory = InventoryRecord.objects.get(variant=item.variant)
         available_before_order = inventory.quantity_available
-        self.stdout.write(
-            f"[UNSAFE][{label}] validation_read stock={available_before_order} requested={item.quantity}"
-        )
+        if getattr(self, "verbose_steps", False):
+            self.stdout.write(
+                f"[UNSAFE][{label}] validation_read stock={available_before_order} requested={item.quantity}"
+            )
 
         if item.quantity > available_before_order:
             raise ValueError(f"Only {available_before_order} available.")
@@ -116,9 +108,11 @@ class Command(BaseCommand):
         inventory.save(update_fields=["quantity_available", "updated_at"])
         self.clear_cart(cart)
 
-        self.stdout.write(
-            f"[UNSAFE][{label}] stock_write old_read={available_before_order} new_stock={inventory.quantity_available}"
-        )
+        if getattr(self, "verbose_steps", False):
+            self.stdout.write(
+                f"[UNSAFE][{label}] stock_write old_read={available_before_order} "
+                f"new_stock={inventory.quantity_available}"
+            )
         return order.id
 
     def row_lock_checkout(self, user, label):
@@ -144,9 +138,10 @@ class Command(BaseCommand):
             raise ValueError("No active cart.")
 
         item = CartItem.objects.select_related("variant").get(cart=cart)
-        self.stdout.write(
-            f"[CONDITIONAL_UPDATE][{label}] atomic_update requested={item.quantity}"
-        )
+        if getattr(self, "verbose_steps", False):
+            self.stdout.write(
+                f"[CONDITIONAL_UPDATE][{label}] atomic_update requested={item.quantity}"
+            )
         updated_rows = InventoryRecord.objects.filter(
             variant=item.variant,
             quantity_available__gte=item.quantity,
@@ -219,10 +214,11 @@ class Command(BaseCommand):
             )
             users.append(user)
 
-        self.stdout.write(
-            f"[{prefix}] setup sku={variant.sku} initial_stock={stock} "
-            f"parallel_checkouts={self.worker_count} quantity_per_checkout=1"
-        )
+        if getattr(self, "verbose_steps", False):
+            self.stdout.write(
+                f"[{prefix}] setup sku={variant.sku} initial_stock={stock} "
+                f"parallel_checkouts={self.worker_count} quantity_per_checkout=1"
+            )
         return variant, users
 
     def build_metric(self, prefix, variant, results, errors, duration_ms):
@@ -250,62 +246,149 @@ class Command(BaseCommand):
             "results": results,
         }
 
-    def print_strategy_summary(self, metric):
-        prefix = metric["prefix"]
-        if prefix == "UNSAFE":
-            diagnosis = "problem=oversell"
-            shows = "This shows: error=oversell, slowdown_or_overload_risk=extra_invalid_orders"
-        elif prefix == "ROW_LOCK":
-            diagnosis = "solution=serialized_stock_access"
-            shows = "This shows: fixed_error=no_oversell, tradeoff=possible_wait_on_locked_stock_row"
-        else:
-            diagnosis = "solution=single_atomic_stock_update"
-            shows = "This shows: fixed_error=no_oversell, tradeoff=fast_failure_when_stock_is_gone"
+    def print_main_header(self):
+        self.stdout.write("\n============================================================")
+        self.stdout.write("Checkout Race Condition Demo")
+        self.stdout.write("============================================================")
+        self.stdout.write("\nScenario:")
+        self.stdout.write(f"- initial_stock: {self.initial_stock}")
+        self.stdout.write(f"- parallel_checkouts: {self.worker_count}")
+        self.stdout.write("- quantity_per_checkout: 1")
 
-        self.stdout.write(f"[{prefix}] results={metric['results']}")
-        self.stdout.write(
-            f"[{prefix}] log_number={self.log_id}-{prefix} duration_ms={metric['duration_ms']} "
-            f"stock={metric['effective_stock']} db_stock={metric['db_stock']} "
-            f"orders={metric['orders']} sold_quantity={metric['sold_quantity']} "
-            f"oversold_units={metric['oversold_units']} successes={metric['success_count']} "
-            f"failures={metric['failed_count']} errors={metric['errors']} {diagnosis}"
-        )
-        self.stdout.write(f"[{prefix}] {shows}")
+    def print_strategy_report(self, metric):
+        prefix = metric["prefix"]
+        self.stdout.write("\n============================================================")
+        self.stdout.write(f"{self.strategy_title(prefix)}: log_id={self.strategy_log_id(prefix)}")
+        self.stdout.write("============================================================")
+        self.stdout.write(f"Method: {self.strategy_method(prefix)}")
+        self.stdout.write("\nMeaning:")
+        self.stdout.write(self.strategy_meaning(prefix))
+        self.stdout.write("\nWorker results:")
+        self.print_worker_results(metric)
+        self.stdout.write("\nSummary:")
+        self.stdout.write(f"- status: {self.strategy_status(metric)}")
+        self.stdout.write(f"- duration_ms: {metric['duration_ms']}")
+        self.stdout.write(f"- db_stock: {metric['db_stock']}")
+        self.stdout.write(f"- effective_stock: {metric['effective_stock']}")
+        self.stdout.write(f"- orders: {metric['orders']}")
+        self.stdout.write(f"- sold_quantity: {metric['sold_quantity']}")
+        self.stdout.write(f"- oversold_units: {metric['oversold_units']}")
+        self.stdout.write(f"- successes: {metric['success_count']}")
+        self.stdout.write(f"- failures: {metric['failed_count']}")
+        self.stdout.write("\nThis shows:")
+        for line in self.strategy_explanation(prefix):
+            self.stdout.write(line)
+
+    def strategy_title(self, prefix):
+        titles = {
+            "UNSAFE": "1. BEFORE (problem)",
+            "ROW_LOCK": "2. AFTER (solution A): same scenario ---> better result",
+            "CONDITIONAL_UPDATE": "2. AFTER (solution B): same scenario ---> better result",
+        }
+        return titles[prefix]
+
+    def strategy_log_id(self, prefix):
+        suffixes = {
+            "UNSAFE": "BEFORE",
+            "ROW_LOCK": "AFTER-A",
+            "CONDITIONAL_UPDATE": "AFTER-B",
+        }
+        return f"{self.log_id}-{suffixes[prefix]}"
+
+    def strategy_method(self, prefix):
+        methods = {
+            "UNSAFE": "UNSAFE_READ_THEN_WRITE",
+            "ROW_LOCK": "ROW_LOCK_SELECT_FOR_UPDATE",
+            "CONDITIONAL_UPDATE": "ATOMIC_CONDITIONAL_UPDATE",
+        }
+        return methods[prefix]
+
+    def strategy_meaning(self, prefix):
+        meanings = {
+            "UNSAFE": (
+                "Two users read the same stock before either checkout writes the new stock.\n"
+                "This can create more successful orders than the available stock."
+            ),
+            "ROW_LOCK": (
+                "The stock row is locked during checkout, so only one checkout can safely "
+                "consume the stock first."
+            ),
+            "CONDITIONAL_UPDATE": (
+                "The stock decrement happens as one atomic conditional update.\n"
+                "If stock is already gone, the update affects 0 rows and checkout fails safely."
+            ),
+        }
+        return meanings[prefix]
+
+    def strategy_status(self, metric):
+        if metric["prefix"] == "UNSAFE" and metric["oversold_units"] > 0:
+            return "PROBLEM_OVERSOLD"
+        if metric["oversold_units"] == 0:
+            return "SAFE_NO_OVERSELL"
+        return "CHECK_RESULT"
+
+    def print_worker_results(self, metric):
+        for label, status, value, duration_ms in sorted(metric["results"]):
+            if status == "SUCCESS":
+                self.stdout.write(f"- {label}: SUCCESS order_id={value} duration_ms={duration_ms}")
+            else:
+                self.stdout.write(f"- {label}: FAILED reason={value} duration_ms={duration_ms}")
+
+    def strategy_explanation(self, prefix):
+        explanations = {
+            "UNSAFE": [
+                (
+                    "This shows: oversell happened because stock validation and stock update "
+                    "were not protected as one safe operation."
+                ),
+                (
+                    "Invalid extra orders also create unnecessary downstream work, which can "
+                    "cause overload or slowdown risk."
+                ),
+            ],
+            "ROW_LOCK": [
+                (
+                    "No oversell occurs. The second checkout fails safely after the stock "
+                    "has already been consumed."
+                ),
+                "This shows: stock access was serialized using row locking.",
+            ],
+            "CONDITIONAL_UPDATE": [
+                (
+                    "No oversell occurs. The stock update is protected as a single atomic "
+                    "database operation."
+                ),
+                "This shows: the conditional update prevents invalid stock decrement.",
+            ],
+        }
+        return explanations[prefix]
 
     def print_comparison(self, metrics):
         by_prefix = {metric["prefix"]: metric for metric in metrics}
         unsafe = by_prefix["UNSAFE"]
-        safe_metrics = [by_prefix["ROW_LOCK"], by_prefix["CONDITIONAL_UPDATE"]]
-        best = min(safe_metrics, key=lambda metric: metric["duration_ms"])
+        row_lock = by_prefix["ROW_LOCK"]
+        conditional_update = by_prefix["CONDITIONAL_UPDATE"]
 
-        self.stdout.write(f"\n3. COMPARISON: log_id={self.log_id}-COMPARISON")
-        self.stdout.write("Duration:")
-        self.stdout.write(f"Before: {unsafe['duration_ms']}ms")
-        for metric in safe_metrics:
-            self.stdout.write(f"After ({metric['prefix']}): {metric['duration_ms']}ms")
-        self.stdout.write("_______")
-        self.stdout.write("Stock:")
-        self.stdout.write(f"Before: stock = {unsafe['effective_stock']}")
-        for metric in safe_metrics:
-            self.stdout.write(f"After ({metric['prefix']}): stock = {metric['effective_stock']}")
-        self.stdout.write("_______")
-        self.stdout.write("Orders and oversell:")
-        self.stdout.write(
-            f"Before: orders={unsafe['orders']}, sold_quantity={unsafe['sold_quantity']}, "
-            f"oversold_units={unsafe['oversold_units']}"
-        )
-        for metric in safe_metrics:
-            self.stdout.write(
-                f"After ({metric['prefix']}): orders={metric['orders']}, "
-                f"sold_quantity={metric['sold_quantity']}, oversold_units={metric['oversold_units']}, "
-                f"failures={metric['failed_count']}"
-            )
-        self.stdout.write(
-            f"Best measured safe strategy: {best['prefix']} duration_ms={best['duration_ms']}"
-        )
-        self.stdout.write(
-            "Note: compare several runs. Thread scheduling and database load can change timings."
-        )
+        self.stdout.write("\n============================================================")
+        self.stdout.write("3. COMPARISON")
+        self.stdout.write("============================================================")
+        self.stdout.write("\nCorrectness:")
+        self.print_correctness_comparison("Before UNSAFE", unsafe)
+        self.print_correctness_comparison("After ROW_LOCK", row_lock)
+        self.print_correctness_comparison("After CONDITIONAL_UPDATE", conditional_update)
+
+        self.stdout.write("\nDuration:")
+        self.stdout.write(f"    Before: {unsafe['duration_ms']}ms")
+        self.stdout.write(f"    After ROW_LOCK: {row_lock['duration_ms']}ms")
+        self.stdout.write(f"    After CONDITIONAL_UPDATE: {conditional_update['duration_ms']}ms")
+
+
+    def print_correctness_comparison(self, title, metric):
+        self.stdout.write(f"\n{title}:")
+        self.stdout.write(f"- stock = {metric['effective_stock']}")
+        self.stdout.write(f"- orders = {metric['orders']}")
+        self.stdout.write(f"- sold_quantity = {metric['sold_quantity']}")
+        self.stdout.write(f"- oversold_units = {metric['oversold_units']}")
 
     def elapsed_ms(self, started_at):
         return round((perf_counter() - started_at) * 1000, 2)
