@@ -1,6 +1,7 @@
 from pathlib import Path
 import os
 from dotenv import load_dotenv
+from kombu import Exchange, Queue
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / '.env')
@@ -94,4 +95,49 @@ SPECTACULAR_SETTINGS = {
     'TITLE': 'E-Commerce Platform API',
     'DESCRIPTION': 'Customer and admin REST APIs',
     'VERSION': '1.0.0',
+}
+# ---------------------------------------------------------
+# CELERY CONFIGURATION
+# ---------------------------------------------------------
+CELERY_BROKER_URL = os.getenv(
+    "CELERY_BROKER_URL",
+    "amqp://guest:guest@localhost:5672//",
+)
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "")
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+CELERY_WORKER_ENABLE_REMOTE_CONTROL = False
+CELERY_TASK_ALWAYS_EAGER = (
+    os.getenv("CELERY_TASK_ALWAYS_EAGER", "False").lower() == "true"
+)
+
+# --- DEAD LETTER QUEUE (DLQ) LOGIC ---
+
+# 1. Define Exchanges
+default_exchange = Exchange('celery', type='direct')
+dlx_exchange     = Exchange('dlx',    type='direct')
+
+CELERY_TASK_QUEUES = (
+    Queue(
+        'celery',
+        Exchange('celery'),
+        routing_key='celery',
+        queue_arguments={
+            'x-dead-letter-exchange':     'dlx',
+            'x-dead-letter-routing-key':  'dlx',   # ← THIS was missing
+        }
+    ),
+    Queue(
+        'dead_letter_queue',
+        Exchange('dlx'),
+        routing_key='dlx',                          # ← must match the line above
+    ),
+)
+
+# 3. Set Defaults
+CELERY_TASK_DEFAULT_QUEUE = 'celery'
+CELERY_TASK_DEFAULT_EXCHANGE = 'celery'
+CELERY_TASK_DEFAULT_ROUTING_KEY = 'celery'
+CELERY_TASK_ACKS_LATE = True
+CELERY_BROKER_TRANSPORT_OPTIONS = {
+    'visibility_timeout': 3600,  # 1 hour in seconds
 }

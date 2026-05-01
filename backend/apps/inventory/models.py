@@ -16,6 +16,7 @@ class StockMovementType(models.TextChoices):
     RELEASE = 'release', 'Release'
     SALE = 'sale', 'Sale'
     ADJUSTMENT = 'adjustment', 'Adjustment'
+    DAILY_PROCESSING = 'daily_processing', 'Daily Sales Processing'
 
 
 class StockMovement(TimeStampedModel):
@@ -23,3 +24,32 @@ class StockMovement(TimeStampedModel):
     movement_type = models.CharField(max_length=30, choices=StockMovementType.choices)
     quantity = models.IntegerField()
     note = models.CharField(max_length=255, blank=True)
+
+
+class ProcessingStatus(models.TextChoices):
+    PENDING = 'pending', 'Pending'
+    IN_PROGRESS = 'in_progress', 'In Progress'
+    COMPLETED = 'completed', 'Completed'
+    FAILED = 'failed', 'Failed'
+
+
+class DailySalesProcessing(TimeStampedModel):
+    """
+    Tracks the status of daily sales inventory processing batches.
+    Ensures idempotency: if a date is already processed, we skip it.
+    Enables checkpointing: track which chunks succeeded/failed.
+    """
+    processing_date = models.DateField(unique=True, db_index=True)
+    status = models.CharField(max_length=20, choices=ProcessingStatus.choices, default=ProcessingStatus.PENDING)
+    total_chunks = models.IntegerField(default=0)
+    processed_chunks = models.IntegerField(default=0)
+    failed_chunks = models.IntegerField(default=0)
+    last_processed_order_id = models.IntegerField(default=0)
+    error_log = models.TextField(blank=True, help_text="JSON-formatted list of failed chunks")
+
+    class Meta:
+        db_table = 'daily_sales_processing'
+        ordering = ['-processing_date']
+
+    def __str__(self):
+        return f"DailySalesProcessing({self.processing_date}, {self.status})"
