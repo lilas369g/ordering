@@ -7,6 +7,7 @@ using the ETL (Extract, Transform, Load) pipeline pattern with fixed-size chunki
 
 Architecture:
 - Fixed-Size Chunking: Process 500 orders per chunk
+- Parallel Fan-out: Dispatch one Celery task per chunk in async mode
 - Extract: Query orders from database
 - Transform: Calculate inventory metrics
 - Load: Bulk update database efficiently
@@ -19,8 +20,11 @@ import json
 import logging
 from datetime import datetime
 
-from celery import shared_task
+from celery import group, shared_task
 from django.db import transaction
+from django.db.models import F, Value
+from django.db.models.functions import Greatest
+from django.utils import timezone
 
 from apps.inventory.models import (
     DailySalesProcessing,
@@ -34,8 +38,83 @@ from apps.orders.models import Order, OrderItem, OrderStatus
 
 logger = logging.getLogger(__name__)
 
-# Configuration: Number of records per chunk
+import os
+import socket
+# Configuration: Number of records per chunk and bulk write batch size
 CHUNK_SIZE = 500
+BULK_BATCH_SIZE = CHUNK_SIZE
+
+
+def _parse_processing_date(processing_date_str=None):
+    if processing_date_str:
+        try:
+            return datetime.strptime(processing_date_str, "%Y-%m-%d").date()
+        except ValueError:
+            logger.error(
+                f"[tasks_batch] Invalid date format: {processing_date_str}"
+            )
+            raise
+
+    return datetime.now().date()
+
+
+def _get_pending_orders_queryset(processing_date):
+    return Order.objects.filter(
+        created_at__date=processing_date,
+        status=OrderStatus.PENDING,
+    ).order_by("id")
+
+
+def _split_order_ids(order_ids):
+    return [
+        order_ids[index:index + CHUNK_SIZE]
+        for index in range(0, len(order_ids), CHUNK_SIZE)
+    ]
+
+
+def _mark_parallel_chunk_success(processing_record_id, chunk_last_order_id):
+    DailySalesProcessing.objects.filter(pk=processing_record_id).update(
+        processed_chunks=F("processed_chunks") + 1,
+        last_processed_order_id=Greatest(
+            F("last_processed_order_id"), Value(chunk_last_order_id)
+        ),
+        updated_at=timezone.now(),
+    )
+
+
+def _append_parallel_chunk_failure(
+    processing_record_id, chunk_num, error_message, chunk_order_ids
+):
+    failure_entry = {
+        "chunk_num": chunk_num,
+        "error": error_message,
+        "order_range": (
+            f"{chunk_order_ids[0]}-{chunk_order_ids[-1]}"
+            if chunk_order_ids
+            else "unknown"
+        ),
+    }
+
+    with transaction.atomic():
+        processing_record = DailySalesProcessing.objects.select_for_update().get(
+            pk=processing_record_id
+        )
+
+        existing_errors = []
+        if processing_record.error_log:
+            try:
+                existing_errors = json.loads(processing_record.error_log)
+            except json.JSONDecodeError:
+                existing_errors = [
+                    {"raw_error_log": processing_record.error_log}
+                ]
+
+        existing_errors.append(failure_entry)
+        processing_record.failed_chunks += 1
+        processing_record.error_log = json.dumps(existing_errors, indent=2)
+        processing_record.save(
+            update_fields=["failed_chunks", "error_log", "updated_at"]
+        )
 
 
 def benchmark_realtime_daily_sales_inventory(processing_date_str=None):
@@ -168,6 +247,366 @@ def benchmark_realtime_daily_sales_inventory(processing_date_str=None):
         "processing_time_ms": int((benchmark_finished_at - benchmark_started_at).total_seconds() * 1000),
         "variant_changes": variant_changes,
     }
+
+
+@shared_task(bind=True, acks_late=True)
+def finalize_daily_sales_inventory_parallel(self, processing_record_id):
+    """Finalize the parallel batch when all chunk tasks have reported back."""
+
+    with transaction.atomic():
+        processing_record = DailySalesProcessing.objects.select_for_update().get(
+            pk=processing_record_id
+        )
+
+        completed_chunks = processing_record.processed_chunks + processing_record.failed_chunks
+
+        if processing_record.status == ProcessingStatus.COMPLETED:
+            return {
+                "status": "completed",
+                "processing_date": str(processing_record.processing_date),
+                "processed_chunks": processing_record.processed_chunks,
+                "failed_chunks": processing_record.failed_chunks,
+                "total_chunks": processing_record.total_chunks,
+            }
+
+        if processing_record.status != ProcessingStatus.IN_PROGRESS:
+            return {
+                "status": processing_record.status,
+                "processing_date": str(processing_record.processing_date),
+                "processed_chunks": processing_record.processed_chunks,
+                "failed_chunks": processing_record.failed_chunks,
+                "total_chunks": processing_record.total_chunks,
+            }
+
+        if completed_chunks < processing_record.total_chunks:
+            logger.info(
+                f"[finalize_daily_sales_inventory_parallel] "
+                f"Waiting for more chunks for {processing_record.processing_date}: "
+                f"{completed_chunks}/{processing_record.total_chunks} complete"
+            )
+            return {
+                "status": "waiting",
+                "processing_date": str(processing_record.processing_date),
+                "processed_chunks": processing_record.processed_chunks,
+                "failed_chunks": processing_record.failed_chunks,
+                "total_chunks": processing_record.total_chunks,
+            }
+
+        processing_record.status = ProcessingStatus.COMPLETED
+        processing_record.save(update_fields=["status", "updated_at"])
+
+    if processing_record.failed_chunks:
+        logger.warning(
+            f"[finalize_daily_sales_inventory_parallel] "
+            f"Completed {processing_record.processing_date} with "
+            f"{processing_record.failed_chunks} failed chunk(s)"
+        )
+    else:
+        logger.info(
+            f"[finalize_daily_sales_inventory_parallel] "
+            f"Completed {processing_record.processing_date} successfully"
+        )
+
+    return {
+        "status": "completed",
+        "processing_date": str(processing_record.processing_date),
+        "processed_chunks": processing_record.processed_chunks,
+        "failed_chunks": processing_record.failed_chunks,
+        "total_chunks": processing_record.total_chunks,
+    }
+
+
+@shared_task(bind=True, max_retries=3, acks_late=True)
+def process_daily_sales_inventory_parallel(
+    self,
+    processing_date_str=None,
+):
+    """Dispatch one Celery task per chunk for parallel daily sales processing."""
+
+    processing_date = _parse_processing_date(processing_date_str)
+
+    logger.info(
+        f"[process_daily_sales_inventory_parallel] "
+        f"Starting parallel fan-out for date: {processing_date}"
+    )
+
+    processing_started_at = datetime.now()
+    processing_record, created = DailySalesProcessing.objects.get_or_create(
+        processing_date=processing_date,
+        defaults={"status": ProcessingStatus.PENDING, "total_chunks": 0},
+    )
+    previous_status = processing_record.status
+
+    if processing_record.status == ProcessingStatus.COMPLETED:
+        logger.info(
+            f"[process_daily_sales_inventory_parallel] "
+            f"Date {processing_date} was already processed on "
+            f"{processing_record.updated_at}. Skipping."
+        )
+        return {
+            "status": "skipped",
+            "reason": "Already processed",
+            "processing_date": str(processing_date),
+        }
+
+    if not created and (
+        processing_record.status != ProcessingStatus.PENDING
+        or processing_record.processed_chunks
+        or processing_record.failed_chunks
+        or processing_record.last_processed_order_id
+        or processing_record.error_log
+    ):
+        logger.warning(
+            f"[process_daily_sales_inventory_parallel] "
+            f"Processing record for {processing_date} is not clean. "
+            f"Reset it before rerunning parallel mode."
+        )
+        return {
+            "status": "skipped",
+            "reason": "Processing record must be reset before rerunning parallel mode",
+            "processing_date": str(processing_date),
+        }
+
+    orders_queryset = _get_pending_orders_queryset(processing_date)
+    total_orders = orders_queryset.count()
+
+    if total_orders == 0:
+        logger.info(
+            f"[process_daily_sales_inventory_parallel] "
+            f"No orders found for {processing_date}. Marking as completed."
+        )
+        processing_record.status = ProcessingStatus.COMPLETED
+        processing_record.total_chunks = 0
+        processing_record.processed_chunks = 0
+        processing_record.failed_chunks = 0
+        processing_record.last_processed_order_id = 0
+        processing_record.error_log = ""
+        processing_record.save(
+            update_fields=[
+                "status",
+                "total_chunks",
+                "processed_chunks",
+                "failed_chunks",
+                "last_processed_order_id",
+                "error_log",
+                "updated_at",
+            ]
+        )
+        return {
+            "status": "completed",
+            "processing_date": str(processing_date),
+            "total_orders": 0,
+            "total_chunks": 0,
+            "processed_chunks": 0,
+            "failed_chunks": 0,
+            "message": "No orders to process",
+            "comparison_report": {
+                "before": {
+                    "status": previous_status,
+                    "affected_inventory_total": 0,
+                    "stock_movements": 0,
+                },
+                "after": {
+                    "status": processing_record.status,
+                    "affected_inventory_total": 0,
+                    "stock_movements": 0,
+                },
+                "comparison": {
+                    "inventory_delta": 0,
+                    "stock_movements_created": 0,
+                    "processing_time_ms": int(
+                        (datetime.now() - processing_started_at).total_seconds() * 1000
+                    ),
+                },
+                "variant_changes": [],
+            },
+        }
+
+    order_ids = list(orders_queryset.values_list("id", flat=True))
+    chunk_order_groups = _split_order_ids(order_ids)
+    total_chunks = len(chunk_order_groups)
+
+    processing_record.status = ProcessingStatus.IN_PROGRESS
+    processing_record.total_chunks = total_chunks
+    processing_record.processed_chunks = 0
+    processing_record.failed_chunks = 0
+    processing_record.last_processed_order_id = 0
+    processing_record.error_log = ""
+    processing_record.save(
+        update_fields=[
+            "status",
+            "total_chunks",
+            "processed_chunks",
+            "failed_chunks",
+            "last_processed_order_id",
+            "error_log",
+            "updated_at",
+        ]
+    )
+
+    logger.info(
+        f"[process_daily_sales_inventory_parallel] "
+        f"Dispatched {total_chunks} chunk task(s) for {total_orders} orders"
+    )
+
+    chunk_group = group(
+        process_daily_sales_inventory_chunk.s(
+            processing_record.id,
+            processing_date.isoformat(),
+            chunk_num + 1,
+            total_chunks,
+            chunk_order_ids,
+        )
+        for chunk_num, chunk_order_ids in enumerate(chunk_order_groups)
+    )
+
+    group_result = chunk_group.apply_async()
+
+    logger.info(
+        f"[process_daily_sales_inventory_parallel] "
+        f"Group {group_result.id} queued for {processing_date}"
+    )
+
+    return {
+        "status": "dispatched",
+        "processing_date": str(processing_date),
+        "total_orders": total_orders,
+        "total_chunks": total_chunks,
+        "processing_record_id": processing_record.id,
+        "task_group_id": group_result.id,
+    }
+
+
+@shared_task(bind=True, max_retries=3, acks_late=True)
+def process_daily_sales_inventory_chunk(
+    self,
+    processing_record_id,
+    processing_date_str,
+    chunk_num,
+    total_chunks,
+    chunk_order_ids,
+):
+    """Process one chunk of orders inside a Celery worker."""
+
+    processing_date = _parse_processing_date(processing_date_str)
+    worker_identity = None
+    try:
+        request_hostname = getattr(self.request, "hostname", None)
+        worker_identity = f"{request_hostname or socket.gethostname()}:{os.getpid()}"
+    except Exception:
+        worker_identity = f"{socket.gethostname()}:{os.getpid()}"
+
+    logger.info(
+        f"[process_daily_sales_inventory_chunk] "
+        f"CHUNK {chunk_num}/{total_chunks}: Starting with {len(chunk_order_ids)} orders (worker={worker_identity})"
+    )
+
+    try:
+        chunk_orders = list(
+            _get_pending_orders_queryset(processing_date).filter(
+                id__in=chunk_order_ids
+            )
+        )
+
+        if not chunk_orders:
+            raise ValueError(
+                f"Chunk {chunk_num} resolved to no orders for {processing_date}"
+            )
+
+        chunk_order_items = list(
+            OrderItem.objects.filter(order_id__in=[order.id for order in chunk_orders])
+            .select_related("variant")
+            .order_by("order_id", "id")
+        )
+
+        inventory_updates = {}
+        stock_movements_to_create = []
+
+        for item in chunk_order_items:
+            variant_id = item.variant_id
+            inventory_updates[variant_id] = inventory_updates.get(variant_id, 0) - item.quantity
+            stock_movements_to_create.append(
+                StockMovement(
+                    variant_id=variant_id,
+                    movement_type=StockMovementType.DAILY_PROCESSING,
+                    quantity=-item.quantity,
+                    note=f"Daily sales processing for {processing_date} (Order #{item.order_id})",
+                )
+            )
+
+        with transaction.atomic():
+            inventory_records_to_update = []
+
+            for variant_id in sorted(inventory_updates):
+                quantity_change = inventory_updates[variant_id]
+                try:
+                    inventory = InventoryRecord.objects.select_for_update().select_related(
+                        "variant"
+                    ).get(variant_id=variant_id)
+                except InventoryRecord.DoesNotExist:
+                    logger.warning(
+                        f"[process_daily_sales_inventory_chunk] "
+                        f"CHUNK {chunk_num}/{total_chunks}: "
+                        f"No inventory record found for variant {variant_id}. Skipping."
+                    )
+                    continue
+
+                inventory.quantity_available = inventory.quantity_available + quantity_change
+                inventory_records_to_update.append(inventory)
+
+            if inventory_records_to_update:
+                InventoryRecord.objects.bulk_update(
+                    inventory_records_to_update,
+                    ["quantity_available"],
+                    batch_size=BULK_BATCH_SIZE,
+                )
+
+            if stock_movements_to_create:
+                StockMovement.objects.bulk_create(
+                    stock_movements_to_create,
+                    batch_size=BULK_BATCH_SIZE,
+                )
+
+        _mark_parallel_chunk_success(processing_record_id, chunk_orders[-1].id)
+
+        finalize_daily_sales_inventory_parallel.delay(processing_record_id)
+
+        logger.info(
+            f"[process_daily_sales_inventory_chunk] "
+            f"CHUNK {chunk_num}/{total_chunks}: Completed successfully (worker={worker_identity})"
+        )
+
+        return {
+            "chunk_num": chunk_num,
+            "status": "completed",
+            "orders": len(chunk_orders),
+            "items": len(chunk_order_items),
+            "variants": len(inventory_updates),
+        }
+
+    except Exception as exc:
+        logger.exception(
+            f"[process_daily_sales_inventory_chunk] "
+            f"CHUNK {chunk_num}/{total_chunks} FAILED: {str(exc)} (worker={worker_identity})"
+        )
+
+        if self.request.retries < self.max_retries:
+            raise self.retry(exc=exc, countdown=60)
+
+        _append_parallel_chunk_failure(
+            processing_record_id,
+            chunk_num,
+            str(exc),
+            chunk_order_ids,
+        )
+        finalize_daily_sales_inventory_parallel.delay(processing_record_id)
+
+        return {
+            "chunk_num": chunk_num,
+            "status": "failed",
+            "error": str(exc),
+            "orders": len(chunk_order_ids),
+        }
 
 
 @shared_task(bind=True, max_retries=3, acks_late=True)
@@ -352,7 +791,7 @@ def process_daily_sales_inventory(self, processing_date_str=None):
 
         logger.info(
             f"[process_daily_sales_inventory] "
-            f"Dataset split into {remaining_chunks} chunk(s) of {CHUNK_SIZE} records each"
+            f"Dataset split into {remaining_chunks} chunk(s) of up to {CHUNK_SIZE} orders each"
         )
 
         # ================================================================
@@ -372,7 +811,7 @@ def process_daily_sales_inventory(self, processing_date_str=None):
             )
             logger.info(
                 f"[process_daily_sales_inventory] CHUNK {chunk_num + 1}: "
-                f"Processing records {chunk_start_idx} to {chunk_end_idx}"
+                f"Processing queryset slice [{chunk_start_idx}:{chunk_end_idx}]"
             )
 
             try:
@@ -467,27 +906,29 @@ def process_daily_sales_inventory(self, processing_date_str=None):
                                 f"No inventory record found for variant {variant_id}. Skipping."
                             )
 
-                    # Bulk update inventory (batch_size prevents memory issues)
+                    # Bulk update inventory (batch size matches the chunk size)
                     if inventory_records_to_update:
                         InventoryRecord.objects.bulk_update(
                             inventory_records_to_update,
                             ["quantity_available"],
-                            batch_size=100,
+                            batch_size=BULK_BATCH_SIZE,
                         )
                         logger.info(
                             f"[process_daily_sales_inventory] CHUNK {chunk_num + 1}: "
-                            f"LOAD: Updated {len(inventory_records_to_update)} inventory records"
+                            f"LOAD: Updated {len(inventory_records_to_update)} inventory records "
+                            f"using bulk batches of {BULK_BATCH_SIZE}"
                         )
 
                     # Bulk create stock movements
                     if stock_movements_to_create:
                         StockMovement.objects.bulk_create(
-                            stock_movements_to_create, batch_size=100
+                            stock_movements_to_create, batch_size=BULK_BATCH_SIZE
                         )
                         stock_movements_created_total += len(stock_movements_to_create)
                         logger.info(
                             f"[process_daily_sales_inventory] CHUNK {chunk_num + 1}: "
-                            f"LOAD: Created {len(stock_movements_to_create)} stock movements"
+                            f"LOAD: Created {len(stock_movements_to_create)} stock movements "
+                            f"using bulk batches of {BULK_BATCH_SIZE}"
                         )
 
                     # ====================================================

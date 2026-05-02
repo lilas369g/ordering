@@ -1,0 +1,9 @@
+[2026-05-02 23:40:50,465: INFO/MainProcess] Connected to amqp://guest:**@127.0.0.1:5672//
+[2026-05-02 23:40:50,480: INFO/MainProcess] worker3@DESKTOP-T1765P2 ready.
+[2026-05-02 23:42:32,967: INFO/MainProcess] Task apps.orders.tasks_batch.process_daily_sales_inventory_chunk[7556450c-cbec-4113-b329-b840f9f9d7c4] received
+[2026-05-02 23:42:32,973: INFO/MainProcess] [process_daily_sales_inventory_chunk] CHUNK 2/3: Starting with 500 orders (worker=worker3@DESKTOP-T1765P2:20748)
+[2026-05-02 23:42:33,653: INFO/MainProcess] [process_daily_sales_inventory_chunk] CHUNK 2/3: Completed successfully (worker=worker3@DESKTOP-T1765P2:20748)
+[2026-05-02 23:42:33,656: INFO/MainProcess] Task apps.orders.tasks_batch.process_daily_sales_inventory_chunk[7556450c-cbec-4113-b329-b840f9f9d7c4] succeeded in 0.6879088000277989s: {'chunk_num': 2, 'status': 'completed', 'orders': 500, 'items': 2500, 'variants': 1}
+[2026-05-02 23:42:33,657: INFO/MainProcess] Task apps.orders.tasks_batch.finalize_daily_sales_inventory_parallel[2e53b480-966a-484f-9ef7-692961ee12b6] received
+[2026-05-02 23:42:33,701: INFO/MainProcess] [finalize_daily_sales_inventory_parallel] Completed 2026-05-04 successfully
+[2026-05-02 23:42:33,701: INFO/MainProcess] Task apps.orders.tasks_batch.finalize_daily_sales_inventory_parallel[2e53b480-966a-484f-9ef7-692961ee12b6] succeeded in 0.043724299990572035s: {'status': 'completed', 'processing_date': '2026-05-04', 'processed_chunks': 3, 'failed_chunks': 0, 'total_chunks': 3}

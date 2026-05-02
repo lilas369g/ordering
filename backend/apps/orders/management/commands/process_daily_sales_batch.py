@@ -15,7 +15,9 @@ from django.core.management.base import BaseCommand, CommandError
 from apps.inventory.models import DailySalesProcessing
 from apps.orders.models import Order, OrderStatus
 from apps.orders.tasks_batch import (
+    CHUNK_SIZE,
     benchmark_realtime_daily_sales_inventory,
+    process_daily_sales_inventory_parallel,
     process_daily_sales_inventory,
 )
 
@@ -44,7 +46,7 @@ class Command(BaseCommand):
         parser.add_argument(
             "--async",
             action="store_true",
-            help="Run as async Celery task (returns immediately). Default is sync.",
+            help="Run as async Celery fan-out (dispatches chunk tasks and returns immediately). Default is sync.",
         )
         parser.add_argument(
             "--eager",
@@ -68,8 +70,12 @@ class Command(BaseCommand):
                     f"Expected YYYY-MM-DD (e.g., 2026-05-01)"
                 )
 
-        # Determine execution mode
-            processing_date_value = datetime.strptime(processing_date, "%Y-%m-%d").date() if processing_date else datetime.now().date()
+        processing_date_value = (
+            datetime.strptime(processing_date, "%Y-%m-%d").date()
+            if processing_date
+            else datetime.now().date()
+        )
+
         compare_mode = options.get("compare", False)
         async_mode = options.get("async", False)
         eager_mode = options.get("eager", False)
@@ -93,7 +99,9 @@ class Command(BaseCommand):
         self.stdout.write(
             f"   Processing Date: {processing_date or 'Today (auto-detected)'}"
         )
-        self.stdout.write(f"   Execution Mode: {'Async (Celery Queue)' if async_mode else 'Sync (Immediate)'}")
+        self.stdout.write(
+            f"   Execution Mode: {'Async (Celery Parallel Fan-out)' if async_mode else 'Sync (Immediate)'}"
+        )
 
         if compare_mode:
             self.stdout.write("   Comparison Mode: Real-time BEFORE vs Batch AFTER")
@@ -107,11 +115,12 @@ class Command(BaseCommand):
 
         self.stdout.write("\n📊 What this command does:")
         self.stdout.write("   1. EXTRACT: Query all PENDING orders from the date")
-        self.stdout.write("   2. SPLIT: Divide into chunks of 500 records")
-        self.stdout.write("   3. TRANSFORM: Calculate inventory deductions per variant")
-        self.stdout.write("   4. LOAD: Bulk update inventory records")
-        self.stdout.write("   5. CHECKPOINT: Track progress for crash recovery")
-        self.stdout.write("   6. PARTIAL FAILURE: Continue on chunk errors")
+        self.stdout.write("   2. SPLIT: Divide into 500-order chunks")
+        self.stdout.write("   3. FAN-OUT: Dispatch one Celery task per chunk in async mode")
+        self.stdout.write("   4. TRANSFORM: Calculate inventory deductions per variant")
+        self.stdout.write("   5. LOAD: Bulk update inventory records")
+        self.stdout.write("   6. CHECKPOINT: Track progress for crash recovery")
+        self.stdout.write("   7. PARTIAL FAILURE: Continue on chunk errors")
 
         self.stdout.write("\n🚀 Triggering task...")
 
@@ -231,17 +240,89 @@ class Command(BaseCommand):
                 return
 
             if async_mode and not eager_mode:
+                self.stdout.write(
+                    self.style.HTTP_INFO("   Running real-time benchmark (dry-run)...")
+                )
+                realtime_result = benchmark_realtime_daily_sales_inventory(processing_date)
+
+                pending_orders = Order.objects.filter(
+                    created_at__date=processing_date_value,
+                    status=OrderStatus.PENDING,
+                ).count()
+                expected_chunks = (
+                    (pending_orders + CHUNK_SIZE - 1) // CHUNK_SIZE
+                    if pending_orders
+                    else 0
+                )
+
                 # Queue the task (returns immediately)
                 self.stdout.write(
-                    self.style.HTTP_INFO("   Queuing task to Celery broker...")
+                    self.style.HTTP_INFO(
+                        "   Queuing parallel fan-out task to Celery broker..."
+                    )
                 )
-                result = process_daily_sales_inventory.delay(processing_date)
+                async_start = datetime.now()
+                result = process_daily_sales_inventory_parallel.delay(
+                    processing_date_value.isoformat()
+                )
+                async_queue_time_ms = int(
+                    (datetime.now() - async_start).total_seconds() * 1000
+                )
+
+                self.stdout.write(self.style.SUCCESS("\n" + "=" * 70))
+                self.stdout.write(self.style.SUCCESS("  ✓ REAL-TIME VS BATCH QUEUED"))
+                self.stdout.write(self.style.SUCCESS("=" * 70))
+
+                self.stdout.write("\n1. BEFORE (المشكلة) - Real-Time Processing")
+                self.stdout.write(
+                    f"   Total Orders: {realtime_result.get('total_orders', 0)}"
+                )
+                self.stdout.write(
+                    f"   Orders Processed: {realtime_result.get('orders_processed', 0)}"
+                )
+                self.stdout.write(
+                    f"   Items Processed: {realtime_result.get('items_processed', 0)}"
+                )
+                self.stdout.write(
+                    f"   Inventory Delta: {realtime_result.get('inventory_delta', 0)}"
+                )
+                self.stdout.write(
+                    f"   Stock Movements: {realtime_result.get('stock_movements_created', 0)}"
+                )
+                self.stdout.write(
+                    f"   Processing Time: {realtime_result.get('processing_time_ms', 0)} ms"
+                )
+
+                self.stdout.write("\n2. AFTER (الحل) - Batch Queued for Celery")
+                self.stdout.write(f"   Total Orders: {pending_orders}")
+                self.stdout.write(f"   Chunk Size: {CHUNK_SIZE}")
+                self.stdout.write(f"   Expected Chunks: {expected_chunks}")
+                self.stdout.write(f"   Queue Status: PENDING")
+                self.stdout.write(
+                    f"   Celery Workers Waiting: 3 workers can consume the chunks"
+                )
+                self.stdout.write(
+                    f"   Task ID: {result.id}"
+                )
+                self.stdout.write(
+                    f"   Queue Time: {async_queue_time_ms} ms"
+                )
+
+                self.stdout.write("\n3. COMPARISON:")
+                realtime_time = realtime_result.get('processing_time_ms', 0)
+                self.stdout.write(f"   Before: {realtime_time} ms")
+                self.stdout.write(f"   After:  {async_queue_time_ms} ms (queue only)")
+                self.stdout.write(
+                    f"   Time Saved Right Now: {realtime_time - async_queue_time_ms} ms"
+                )
+                self.stdout.write(
+                    f"   Chunks Waiting For Consumers: {expected_chunks}"
+                )
+
                 self.stdout.write(
                     self.style.SUCCESS(
-                        f"\n✓ Task queued successfully!\n"
-                        f"   Task ID: {result.id}\n"
-                        f"   Status: PENDING\n"
-                        f"   Check Celery worker logs for real-time progress."
+                        "\n✓ Task queued successfully!\n"
+                        f"   Check Celery worker logs for CHUNK 1/{expected_chunks if expected_chunks else '?'} ..."
                     )
                 )
                 return

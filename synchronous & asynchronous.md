@@ -279,129 +279,7 @@ You should see the RabbitMQ Management Dashboard homepage.
 
 ---
 
-## 8. Step 5 — Configure Django + Celery
-
-Your `settings.py` needs a few additions to work correctly with RabbitMQ 4.x on Windows.
-
-### 8.1 Add These Settings to `settings.py`
-
-```python
-# ──────────────────────────────────────────────
-# Celery / RabbitMQ Configuration
-# ──────────────────────────────────────────────
-
-# The broker URL — points to your local RabbitMQ instance
-# guest:guest is the default RabbitMQ username:password
-# localhost:5672 is the default RabbitMQ port
-# The trailing // is the "virtual host" (default vhost in RabbitMQ)
-CELERY_BROKER_URL = os.getenv(
-    "CELERY_BROKER_URL",
-    "amqp://guest:guest@localhost:5672//",
-)
-
-# Where to store task results (disabled for now — not needed for basic use)
-CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "")
-
-# Fix 1: Required for Celery 6.0 compatibility
-# Tells Celery to keep retrying the broker connection on startup
-CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
-
-# Fix 2: Disables a feature that causes errors with RabbitMQ 4.x on Windows
-# RabbitMQ 4.x deprecated 'transient_nonexcl_queues' which Celery's
-# remote control feature relies on
-CELERY_WORKER_ENABLE_REMOTE_CONTROL = False
-
-# Development-only setting — when True, tasks run immediately (synchronously)
-# in the same process instead of going through RabbitMQ.
-# NEVER set this to True in production — it defeats the entire purpose.
-CELERY_TASK_ALWAYS_EAGER = (
-    os.getenv("CELERY_TASK_ALWAYS_EAGER", "False").lower() == "true"
-)
-```
-
-### 8.2 Your `celery.py` File
-
-Make sure your `config/celery.py` looks like this:
-
-```python
-import os
-from celery import Celery
-
-# Tell Celery which Django settings module to use
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
-
-app = Celery("config")
-
-# This reads all CELERY_ prefixed settings from settings.py
-app.config_from_object("django.conf:settings", namespace="CELERY")
-
-# Automatically find tasks.py in all INSTALLED_APPS
-app.autodiscover_tasks()
-```
-
-### 8.3 Your `config/__init__.py`
-
-```python
-# This makes sure Celery is loaded when Django starts
-from .celery import app as celery_app
-
-__all__ = ("celery_app",)
-```
-
-### 8.4 Your Task Definition
-
-```python
-# apps/orders/tasks.py
-import time
-from celery import shared_task
-
-@shared_task(bind=True, max_retries=3)
-def process_side_task(self, task_name, duration_ms):
-    """
-    This is the CONSUMER. It runs in a completely separate process.
-    
-    bind=True   → gives us access to `self` (the task instance)
-    max_retries → if this task fails, Celery will retry it up to 3 times
-    """
-    try:
-        print(f"Working on: {task_name}")
-        time.sleep(duration_ms / 1000)  # simulate work
-        return f"Finished: {task_name}"
-    except Exception as exc:
-        # countdown=60 means "wait 60 seconds before retrying"
-        # This is "exponential backoff" — a real-world best practice
-        raise self.retry(exc=exc, countdown=60)
-```
-
-### 8.5 Your Producer Command
-
-```python
-# apps/orders/management/commands/simulate_async_queue.py
-from django.core.management.base import BaseCommand
-from apps.orders.tasks import process_side_task
-
-class Command(BaseCommand):
-    help = "Enqueue sample side tasks to demonstrate async queue behavior."
-
-    def handle(self, *args, **options):
-        order_id = "ORD-123"
-
-        # .delay() is the key method — it sends the task to RabbitMQ
-        # instead of running it immediately. The Producer's job is done
-        # the moment .delay() returns.
-        process_side_task.delay("Send Confirmation Email", 2000)
-        process_side_task.delay("Update Inventory Levels", 1500)
-        process_side_task.delay("Notify Shipping Partner", 3000)
-
-        self.stdout.write(
-            f"Queued 3 background tasks for order {order_id}. "
-            "Run a Celery worker to process them."
-        )
-```
-
----
-
-## 9. Step 6 — Run the Full System
+## 8. Run the Full System
 
 You need **two separate terminal windows** — one for the Worker, one to trigger tasks. Both must be in your project's `backend/` directory with the virtual environment activated.
 
@@ -409,6 +287,8 @@ You need **two separate terminal windows** — one for the Worker, one to trigge
 
 ```powershell
 python -m celery -A config worker -l info -P solo --without-mingle --without-gossip
+
+#python -m celery -A config worker -l info -P solo --without-mingle --without-gossip -Q celery
 ```
 
 **What each flag means:**
@@ -929,6 +809,45 @@ CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 
 **Fix:** Use application-level DLQ routing — publish directly to `dead_letter_queue` via `current_app.send_task()` when `MaxRetriesExceededError` is caught. This uses the same producer path as `.delay()` and works on all environments. Add the infinite-loop guard at the top of the task. See [Section 12](#12-dead-letter-queue-dlq--handling-permanently-failed-tasks) for the full implementation.
 
+### ❌ DLQ Looks Empty Even Though Logs Say "Sending to DLQ"
+
+```
+[DLQ] Routed 'CRITICAL_FAIL_TASK' to dead_letter_queue after 4 attempts.
+# but dashboard still shows dead_letter_queue = 0 ready
+```
+
+**Cause:** Your worker is consuming `dead_letter_queue` too. If one worker listens to both `celery` and `dead_letter_queue`, the DLQ message is consumed immediately after it is published. In logs this appears as:
+
+```
+Task ... received
+[DLQ INSPECTOR] 'CRITICAL_FAIL_TASK' is in quarantine...
+Task ... succeeded
+```
+
+This means DLQ worked, but the message did not stay in the queue long enough to appear as `Ready`.
+
+**Fix (recommended for demo/inspection):**
+
+1. Start the main worker on the main queue only:
+
+```powershell
+python -m celery -A config worker -l info -P solo --without-mingle --without-gossip -Q celery
+```
+
+2. Run the producer:
+
+```powershell
+python manage.py simulate_async_queue
+```
+
+3. Check dashboard: `dead_letter_queue` should now show `Ready = 1`.
+
+4. Optional: inspect DLQ later with a separate worker:
+
+```powershell
+python -m celery -A config worker -l info -P solo --without-mingle --without-gossip -Q dead_letter_queue
+```
+
 ---
 
 ## Quick Reference — Start Everything
@@ -937,10 +856,13 @@ After initial setup, this is all you need every time:
 
 ```powershell
 # Terminal 1: Start the worker
-python -m celery -A config worker -l info -P solo --without-mingle --without-gossip
+python -m celery -A config worker -l info -P solo --without-mingle --without-gossip -Q celery
 
 # Terminal 2: Trigger tasks (including the DLQ test)
 python manage.py simulate_async_queue
+
+# Optional Terminal 3: Inspect DLQ messages (start only when needed)
+python -m celery -A config worker -l info -P solo --without-mingle --without-gossip -Q dead_letter_queue
 
 # Browser: Monitor everything
 # http://localhost:15672  (guest / guest)

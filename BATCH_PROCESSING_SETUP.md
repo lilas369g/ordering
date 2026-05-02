@@ -1,140 +1,117 @@
 # Batch Processing Setup
 
-This is the practical runbook for testing daily sales batch processing.
-Use this file when you want the shortest path from seeded data to a visible
-before/after comparison.
+This is the short Windows runbook for the daily sales batch.
 
-## What each mode does
+## What it does
 
-- `--compare` runs a synchronous benchmark first, then the batch ETL, and prints a before/after comparison.
-- `--async` queues the same batch task to Celery so the worker runs it in the background.
-- `reset_daily_sales_processing` clears one processed date so you can rerun it intentionally.
+- `process_daily_sales_batch` runs a real-time benchmark, then queues the Celery fan-out batch.
+- Orders are split into chunks of 500.
+- Each chunk is processed by a worker, then the finalizer marks the date complete.
 
-## Fresh Demo Run
+## Prerequisites
 
-Use a fresh date that still has pending orders and has not been processed yet.
+- Run commands from `backend`
+- Python virtualenv: `backend/.venv`
+- RabbitMQ running locally, or set `CELERY_BROKER_URL`
 
-1. Open PowerShell, go to `backend`, and activate the virtual environment.
+## 1) Activate the virtualenv
 
 ```powershell
 cd "C:\Users\ru\Desktop\New folder\ordering\backend"
-.\.venv\Scripts\Activate.ps1
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+& .\.venv\Scripts\Activate.ps1
 ```
 
-2. Seed the demo catalog.
+## 2) Start Celery workers
+
+Open 3 terminals and run one worker in each terminal:
+
+```powershell
+python -m celery -A config worker -l info -P solo --without-gossip --without-mingle --prefetch-multiplier=1 -n worker1@%h --logfile=worker1.log
+```
+
+Use `worker2@%h --logfile=worker2.log` and `worker3@%h --logfile=worker3.log` in the other two terminals.
+
+## 3) Seed demo data
 
 ```powershell
 python manage.py seed_demo_store
+python manage.py seed_batch_demo_orders 2026-05-04 --orders 1500
 ```
 
-3. Seed the demo orders for one date.
-
-```powershell
-python manage.py seed_batch_demo_orders 2026-05-04
-```
-
-4. Verify that the pending orders exist.
-
-```powershell
-python manage.py shell
-```
-
-```python
-from datetime import datetime
-from apps.orders.models import Order, OrderStatus
-
-target_date = datetime(2026, 5, 4).date()
-demo_tag = "BATCH-DEMO"
-
-print(
-    Order.objects.filter(
-        customer_name__startswith=demo_tag,
-        status=OrderStatus.PENDING,
-    ).count()
-)
-print(
-    Order.objects.filter(
-        created_at__date=target_date,
-        status=OrderStatus.PENDING,
-    ).count()
-)
-```
-
-Expected result: both counts should be `100`.
-
-5. Run the compare command.
-
-```powershell
-python manage.py process_daily_sales_batch 2026-05-04 --compare
-```
-
-What you should see:
-
-- BEFORE = real-time benchmark
-- AFTER = batch ETL
-- COMPARISON = time saved, inventory delta, stock movements, and order counts
-
-If the command says the date already has a processing record, run the reset
-command first and then retry compare.
-
-```powershell
-python manage.py reset_daily_sales_processing 2026-05-04
-```
-
-Use `--dry-run` if you want to preview what will be removed.
-
-```powershell
-python manage.py reset_daily_sales_processing 2026-05-04 --dry-run
-```
-
-## Why async is useful in the code
-
-Async does not change the ETL logic. It changes where the work runs.
-The same task stays in `apps/orders/tasks_batch.py`, but Celery executes it in
-the background instead of blocking the shell or a request.
-
-That gives you these benefits:
-
-- the command returns immediately
-- the worker can retry the job if it crashes
-- you can scale to more workers later without rewriting the ETL
-- the same processing code can be used from CLI, Celery, or a future API trigger
-
-On Windows with a solo worker, the main value is responsiveness and queueing,
-not parallel throughput.
-
-## Run the batch in the background
-
-1. Start the Celery worker.
-
-```powershell
-python -m celery -A config worker -l info -P solo --without-mingle --without-gossip
-```
-
-2. Queue the batch.
+## 4) Queue the batch
 
 ```powershell
 python manage.py process_daily_sales_batch 2026-05-04 --async
 ```
 
-3. Watch the worker terminal.
+Expected output:
 
-The worker log is the source of truth. This project does not create
-`logs/django.log` by default.
+- BEFORE shows the real-time benchmark
+- AFTER shows the queued batch and expected chunks
+- COMPARISON shows the queue time saved
 
-## Troubleshooting
+## 5) Check the status in a readable format
 
-- If compare refuses to run, the date already has a processing record. Reset it or use a fresh date.
-- If the compare run finds no pending orders, seed the demo orders again.
-- If you are using `--async`, the task may finish too fast to show a queue backlog. That is normal.
-- If you want a file log like `logs/django.log`, you must add a Django `FileHandler` in `config/settings.py` first.
+```powershell
+python manage.py show_daily_sales_processing 2026-05-04
+```
 
-## Related files
+This prints:
 
-| File | Purpose |
-|------|---------|
-| `backend/apps/orders/tasks_batch.py` | Batch ETL task and benchmark helper |
-| `backend/apps/orders/management/commands/process_daily_sales_batch.py` | CLI entry point for sync, async, and compare runs |
-| `backend/apps/orders/management/commands/reset_daily_sales_processing.py` | Reset a processed date so it can be rerun |
-| `docs/BATCH_PROCESSING_GUIDE.md` | Technical explanation of the implementation |
-| `BATCH_PROCESSING_IMPLEMENTATION.md` | High-level implementation summary |
+- pending orders
+- chunk size
+- expected chunks
+- current status
+- processed / failed chunks
+- last processed order ID
+
+## 6) See which workers are attached
+
+```powershell
+python manage.py show_celery_consumers --host localhost --port 15672 --user guest --password guest --queue celery
+```
+
+This shows the consumers currently attached to the `celery` queue.
+
+It also prints chunk-to-worker mapping by reading `worker*.log` lines.
+
+## 7) Reset the date before rerunning
+
+Preview first:
+
+```powershell
+python manage.py reset_daily_sales_processing 2026-05-04 --dry-run
+```
+
+Then reset for real:
+
+```powershell
+python manage.py reset_daily_sales_processing 2026-05-04
+```
+
+If you need to restore the demo stock for `RICE-S` before rerunning the benchmark:
+
+```powershell
+python manage.py shell -c "from apps.inventory.models import InventoryRecord; ir=InventoryRecord.objects.get(variant__sku='RICE-S'); ir.quantity_available=7500; ir.save(update_fields=['quantity_available']); print('RICE-S stock reset to', ir.quantity_available)"
+```
+
+Run the async batch again if needed:
+
+```powershell
+python manage.py process_daily_sales_batch 2026-05-04 --async
+```
+
+## What to look for
+
+- Worker logs should show `CHUNK 1/3`, `CHUNK 2/3`, and `CHUNK 3/3`.
+- Each chunk log includes `(worker=HOST:PID)` so you can see which worker handled it.
+- The finalizer should end with `processed_chunks: 3, failed_chunks: 0`.
+
+## Quick compare mode
+
+If you want to compare real-time vs batch without queueing first:
+
+```powershell
+python manage.py process_daily_sales_batch 2026-05-04 --compare
+```
