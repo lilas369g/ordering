@@ -2,8 +2,9 @@
 Management command to manually trigger daily sales inventory batch processing.
 
 Usage:
-    python manage.py process_daily_sales python manage.py process_daily_sales_batch
+    python manage.py process_daily_sales_batch
     python manage.py process_daily_sales_batch 2026-05-01
+    python manage.py process_daily_sales_batch 2026-05-01 --compare
 """
 
 import logging
@@ -11,7 +12,12 @@ from datetime import datetime
 
 from django.core.management.base import BaseCommand, CommandError
 
-from apps.orders.tasks_batch import process_daily_sales_inventory
+from apps.inventory.models import DailySalesProcessing
+from apps.orders.models import Order, OrderStatus
+from apps.orders.tasks_batch import (
+    benchmark_realtime_daily_sales_inventory,
+    process_daily_sales_inventory,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -29,6 +35,11 @@ class Command(BaseCommand):
             nargs="?",
             type=str,
             help="Date to process in YYYY-MM-DD format (e.g., 2026-05-01). Defaults to today.",
+        )
+        parser.add_argument(
+            "--compare",
+            action="store_true",
+            help="Run a real-time benchmark first, then run the batch ETL and print a BEFORE/AFTER/COMPARISON report.",
         )
         parser.add_argument(
             "--async",
@@ -58,8 +69,13 @@ class Command(BaseCommand):
                 )
 
         # Determine execution mode
+            processing_date_value = datetime.strptime(processing_date, "%Y-%m-%d").date() if processing_date else datetime.now().date()
+        compare_mode = options.get("compare", False)
         async_mode = options.get("async", False)
         eager_mode = options.get("eager", False)
+
+        if compare_mode and async_mode:
+            raise CommandError("--compare cannot be used with --async. Use sync mode for the benchmark.")
 
         self.stdout.write(
             self.style.WARNING(
@@ -79,6 +95,9 @@ class Command(BaseCommand):
         )
         self.stdout.write(f"   Execution Mode: {'Async (Celery Queue)' if async_mode else 'Sync (Immediate)'}")
 
+        if compare_mode:
+            self.stdout.write("   Comparison Mode: Real-time BEFORE vs Batch AFTER")
+
         if eager_mode:
             self.stdout.write(
                 self.style.WARNING(
@@ -97,6 +116,120 @@ class Command(BaseCommand):
         self.stdout.write("\n🚀 Triggering task...")
 
         try:
+            if compare_mode:
+                if DailySalesProcessing.objects.filter(processing_date=processing_date_value).exists():
+                    raise CommandError(
+                        f"Processing date {processing_date} already has a processing record. Use a fresh date with pending orders for comparison."
+                    )
+
+                pending_orders = Order.objects.filter(
+                    created_at__date=processing_date_value,
+                    status=OrderStatus.PENDING,
+                ).count()
+                if pending_orders == 0:
+                    raise CommandError(
+                        f"No pending orders found for {processing_date}. Create a fresh test dataset first so the comparison is meaningful."
+                    )
+
+                self.stdout.write(
+                    self.style.HTTP_INFO("   Running real-time benchmark (dry-run)...")
+                )
+                realtime_result = benchmark_realtime_daily_sales_inventory(processing_date)
+
+                self.stdout.write(
+                    self.style.HTTP_INFO("   Running batch ETL (real save)...")
+                )
+                batch_result = process_daily_sales_inventory(processing_date)
+
+                batch_report = batch_result.get("comparison_report", {})
+                batch_before = batch_report.get("before", {})
+                batch_after = batch_report.get("after", {})
+                batch_comparison = batch_report.get("comparison", {})
+
+                self.stdout.write(
+                    self.style.SUCCESS("\n" + "=" * 70)
+                )
+                self.stdout.write(
+                    self.style.SUCCESS("  ✓ REAL-TIME VS BATCH COMPARISON")
+                )
+                self.stdout.write(
+                    self.style.SUCCESS("=" * 70)
+                )
+
+                self.stdout.write("\n1. BEFORE (المشكلة) - Real-Time Processing")
+                self.stdout.write(f"   Status: {realtime_result.get('status', 'unknown').upper()}")
+                self.stdout.write(f"   Total Orders: {realtime_result.get('total_orders', 0)}")
+                self.stdout.write(f"   Orders Processed: {realtime_result.get('orders_processed', 0)}")
+                self.stdout.write(f"   Items Processed: {realtime_result.get('items_processed', 0)}")
+                self.stdout.write(
+                    f"   Inventory Before: {realtime_result.get('inventory_total_before', 0)}"
+                )
+                self.stdout.write(
+                    f"   Inventory After: {realtime_result.get('inventory_total_after', 0)}"
+                )
+                self.stdout.write(
+                    f"   Inventory Delta: {realtime_result.get('inventory_delta', 0)}"
+                )
+                self.stdout.write(
+                    f"   Stock Movements: {realtime_result.get('stock_movements_created', 0)}"
+                )
+                self.stdout.write(
+                    f"   Processing Time: {realtime_result.get('processing_time_ms', 0)} ms"
+                )
+
+                if realtime_result.get("variant_changes"):
+                    self.stdout.write("   Variant Changes:")
+                    for change in realtime_result.get("variant_changes", [])[:5]:
+                        self.stdout.write(
+                            f"   - {change['sku']}: {change['before']} -> {change['after']} (Δ {change['delta']})"
+                        )
+
+                self.stdout.write("\n2. AFTER (الحل) - Batch ETL")
+                self.stdout.write(f"   Status: {batch_result.get('status', 'unknown').upper()}")
+                self.stdout.write(f"   Total Orders: {batch_result.get('total_orders', 0)}")
+                self.stdout.write(f"   Total Chunks: {batch_result.get('total_chunks', 0)}")
+                self.stdout.write(
+                    f"   Successfully Processed: {batch_result.get('processed_chunks', 0)}"
+                )
+                self.stdout.write(f"   Failed Chunks: {batch_result.get('failed_chunks', 0)}")
+                self.stdout.write(
+                    f"   Inventory Before: {batch_before.get('affected_inventory_total', 0)}"
+                )
+                self.stdout.write(
+                    f"   Inventory After: {batch_after.get('affected_inventory_total', 0)}"
+                )
+                self.stdout.write(
+                    f"   Inventory Delta: {batch_comparison.get('inventory_delta', 0)}"
+                )
+                self.stdout.write(
+                    f"   Stock Movements: {batch_after.get('stock_movements', 0)}"
+                )
+                self.stdout.write(
+                    f"   Processing Time: {batch_comparison.get('processing_time_ms', 0)} ms"
+                )
+
+                self.stdout.write("\n3. COMPARISON:")
+                realtime_time = realtime_result.get('processing_time_ms', 0)
+                batch_time = batch_comparison.get('processing_time_ms', 0)
+                time_saved = realtime_time - batch_time
+                speedup = round(realtime_time / batch_time, 2) if batch_time else None
+
+                self.stdout.write(f"   Before (Real-Time): {realtime_time} ms")
+                self.stdout.write(f"   After (Batch): {batch_time} ms")
+                self.stdout.write(f"   Time Saved: {time_saved} ms")
+                if speedup is not None:
+                    self.stdout.write(f"   Speedup: {speedup}x")
+
+                self.stdout.write(
+                    f"   Inventory Delta Match: {realtime_result.get('inventory_delta', 0) == batch_comparison.get('inventory_delta', 0)}"
+                )
+                self.stdout.write(
+                    f"   Stock Movements Match: {realtime_result.get('stock_movements_created', 0) == batch_after.get('stock_movements', 0)}"
+                )
+
+                self.stdout.write("\n✅ Comparison completed successfully.\n")
+                return
+
             if async_mode and not eager_mode:
                 # Queue the task (returns immediately)
                 self.stdout.write(
@@ -142,10 +275,70 @@ class Command(BaseCommand):
                 )
 
                 self.stdout.write(f"\n📊 Results:")
-                self.stdout.write(f"   Status: {result.get('status', 'unknown').upper()}")
+                status = result.get('status', 'unknown')
+                self.stdout.write(f"   Status: {status.upper()}")
                 self.stdout.write(
                     f"   Processing Date: {result.get('processing_date', 'N/A')}"
                 )
+
+                if status == 'skipped':
+                    self.stdout.write(
+                        f"   Reason: {result.get('reason', 'Already processed')}"
+                    )
+                    self.stdout.write("   Total Orders: N/A (already processed)")
+                    self.stdout.write("   Total Chunks: 0")
+                    self.stdout.write("   Successfully Processed: 0")
+                    self.stdout.write("   Failed Chunks: 0")
+                    self.stdout.write("\n✅ Batch processing task completed.\n")
+                    return
+
+                comparison_report = result.get("comparison_report", {})
+                if comparison_report:
+                    before = comparison_report.get("before", {})
+                    after = comparison_report.get("after", {})
+                    comparison = comparison_report.get("comparison", {})
+                    variant_changes = comparison_report.get("variant_changes", [])
+
+                    self.stdout.write("\n1. BEFORE (المشكلة):")
+                    self.stdout.write(
+                        f"   Status: {before.get('status', 'N/A')}"
+                    )
+                    self.stdout.write(
+                        f"   Inventory total: {before.get('affected_inventory_total', 0)}"
+                    )
+                    self.stdout.write(
+                        f"   Stock movements today: {before.get('stock_movements', 0)}"
+                    )
+
+                    self.stdout.write("\n2. AFTER (الحل):")
+                    self.stdout.write(
+                        f"   Status: {after.get('status', 'N/A')}"
+                    )
+                    self.stdout.write(
+                        f"   Inventory total: {after.get('affected_inventory_total', 0)}"
+                    )
+                    self.stdout.write(
+                        f"   Stock movements today: {after.get('stock_movements', 0)}"
+                    )
+
+                    self.stdout.write("\n3. COMPARISON:")
+                    self.stdout.write(
+                        f"   Inventory delta: {comparison.get('inventory_delta', 0)}"
+                    )
+                    self.stdout.write(
+                        f"   Stock movements created: {comparison.get('stock_movements_created', 0)}"
+                    )
+                    self.stdout.write(
+                        f"   Processing time: {comparison.get('processing_time_ms', 0)} ms"
+                    )
+
+                    if variant_changes:
+                        self.stdout.write("   Variant changes:")
+                        for change in variant_changes[:5]:
+                            self.stdout.write(
+                                f"   - {change['sku']}: {change['before']} -> {change['after']} (Δ {change['delta']})"
+                            )
+
                 self.stdout.write(
                     f"   Total Orders: {result.get('total_orders', 0)}"
                 )

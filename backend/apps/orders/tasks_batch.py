@@ -38,6 +38,138 @@ logger = logging.getLogger(__name__)
 CHUNK_SIZE = 500
 
 
+def benchmark_realtime_daily_sales_inventory(processing_date_str=None):
+    """Simulate a naive real-time processor and roll back the DB changes.
+
+    This is used for benchmarking only. It updates inventory and creates stock
+    movements one row at a time, then rolls the transaction back so the batch
+    processor can run on the same dataset afterwards.
+    """
+
+    if processing_date_str:
+        try:
+            processing_date = datetime.strptime(processing_date_str, "%Y-%m-%d").date()
+        except ValueError:
+            logger.error(
+                f"[benchmark_realtime_daily_sales_inventory] Invalid date format: {processing_date_str}"
+            )
+            raise
+    else:
+        processing_date = datetime.now().date()
+
+    logger.info(
+        f"[benchmark_realtime_daily_sales_inventory] Starting real-time benchmark for date: {processing_date}"
+    )
+
+    benchmark_started_at = datetime.now()
+
+    orders_queryset = Order.objects.filter(
+        created_at__date=processing_date,
+        status=OrderStatus.PENDING,
+    ).order_by("id")
+
+    total_orders = orders_queryset.count()
+    before_inventory_snapshot = {}
+    after_inventory_snapshot = {}
+    stock_movements_created = 0
+    orders_processed = 0
+    items_processed = 0
+    missing_inventory_variants = 0
+
+    with transaction.atomic():
+        for order in orders_queryset:
+            order_items = list(
+                OrderItem.objects.filter(order_id=order.id)
+                .select_related("variant")
+                .order_by("id")
+            )
+
+            if not order_items:
+                continue
+
+            orders_processed += 1
+
+            for item in order_items:
+                try:
+                    inventory = InventoryRecord.objects.select_for_update().get(
+                        variant_id=item.variant_id
+                    )
+                except InventoryRecord.DoesNotExist:
+                    missing_inventory_variants += 1
+                    logger.warning(
+                        f"[benchmark_realtime_daily_sales_inventory] No inventory record found for variant {item.variant_id}. Skipping."
+                    )
+                    continue
+
+                if item.variant_id not in before_inventory_snapshot:
+                    before_inventory_snapshot[item.variant_id] = {
+                        "sku": inventory.variant.sku,
+                        "quantity_available": inventory.quantity_available,
+                    }
+
+                inventory.quantity_available = inventory.quantity_available - item.quantity
+                inventory.save(update_fields=["quantity_available"])
+
+                after_inventory_snapshot[item.variant_id] = {
+                    "sku": inventory.variant.sku,
+                    "quantity_available": inventory.quantity_available,
+                }
+
+                StockMovement.objects.create(
+                    variant_id=item.variant_id,
+                    movement_type=StockMovementType.DAILY_PROCESSING,
+                    quantity=-item.quantity,
+                    note=f"Real-time benchmark for {processing_date} (Order #{item.order_id})",
+                )
+
+                stock_movements_created += 1
+                items_processed += 1
+
+        transaction.set_rollback(True)
+
+    benchmark_finished_at = datetime.now()
+    before_inventory_total = sum(
+        item["quantity_available"] for item in before_inventory_snapshot.values()
+    )
+    after_inventory_total = sum(
+        item["quantity_available"] for item in after_inventory_snapshot.values()
+    )
+
+    variant_changes = []
+    for variant_id, before_snapshot in before_inventory_snapshot.items():
+        after_snapshot = after_inventory_snapshot.get(variant_id, before_snapshot)
+        variant_changes.append(
+            {
+                "sku": before_snapshot["sku"],
+                "before": before_snapshot["quantity_available"],
+                "after": after_snapshot["quantity_available"],
+                "delta": after_snapshot["quantity_available"] - before_snapshot["quantity_available"],
+            }
+        )
+
+    variant_changes.sort(key=lambda item: item["sku"])
+
+    logger.info(
+        f"[benchmark_realtime_daily_sales_inventory] Completed real-time benchmark for date: {processing_date}"
+    )
+
+    return {
+        "mode": "real-time",
+        "status": "completed",
+        "processing_date": str(processing_date),
+        "total_orders": total_orders,
+        "orders_processed": orders_processed,
+        "items_processed": items_processed,
+        "missing_inventory_variants": missing_inventory_variants,
+        "inventory_total_before": before_inventory_total,
+        "inventory_total_after": after_inventory_total,
+        "inventory_delta": after_inventory_total - before_inventory_total,
+        "stock_movements_created": stock_movements_created,
+        "processing_time_ms": int((benchmark_finished_at - benchmark_started_at).total_seconds() * 1000),
+        "variant_changes": variant_changes,
+    }
+
+
 @shared_task(bind=True, max_retries=3, acks_late=True)
 def process_daily_sales_inventory(self, processing_date_str=None):
     """
@@ -83,6 +215,8 @@ def process_daily_sales_inventory(self, processing_date_str=None):
         f"Starting ETL pipeline for date: {processing_date}"
     )
 
+    processing_started_at = datetime.now()
+
     try:
         # ================================================================
         # IDEMPOTENCY CHECK: Has this date already been processed?
@@ -116,6 +250,13 @@ def process_daily_sales_inventory(self, processing_date_str=None):
             else 0
         )
         already_processed_chunks = processing_record.processed_chunks
+        existing_stock_movements = StockMovement.objects.filter(
+            movement_type=StockMovementType.DAILY_PROCESSING,
+            created_at__date=processing_date,
+        ).count()
+        inventory_before_snapshot = {}
+        inventory_after_snapshot = {}
+        stock_movements_created_total = 0
 
         # Mark as in-progress
         processing_record.status = ProcessingStatus.IN_PROGRESS
@@ -182,6 +323,24 @@ def process_daily_sales_inventory(self, processing_date_str=None):
                 "total_orders": total_orders,
                 "processed_orders": total_orders - remaining_orders,
                 "message": "No orders to process" if total_orders == 0 else "Checkpoint already covers all orders",
+                "comparison_report": {
+                    "before": {
+                        "status": previous_status,
+                        "affected_inventory_total": 0,
+                        "stock_movements": existing_stock_movements,
+                    },
+                    "after": {
+                        "status": processing_record.status,
+                        "affected_inventory_total": 0,
+                        "stock_movements": existing_stock_movements,
+                    },
+                    "comparison": {
+                        "inventory_delta": 0,
+                        "stock_movements_created": 0,
+                        "processing_time_ms": int((datetime.now() - processing_started_at).total_seconds() * 1000),
+                    },
+                    "variant_changes": [],
+                },
             }
 
         # Calculate number of chunks needed
@@ -287,10 +446,19 @@ def process_daily_sales_inventory(self, processing_date_str=None):
                             inventory = InventoryRecord.objects.select_for_update().get(
                                 variant_id=variant_id
                             )
+                            if variant_id not in inventory_before_snapshot:
+                                inventory_before_snapshot[variant_id] = {
+                                    "sku": inventory.variant.sku,
+                                    "quantity_available": inventory.quantity_available,
+                                }
                             # Row lock from select_for_update() keeps the update atomic inside this chunk.
                             inventory.quantity_available = (
                                 inventory.quantity_available + quantity_change
                             )
+                            inventory_after_snapshot[variant_id] = {
+                                "sku": inventory.variant.sku,
+                                "quantity_available": inventory.quantity_available,
+                            }
                             inventory_records_to_update.append(inventory)
 
                         except InventoryRecord.DoesNotExist:
@@ -316,6 +484,7 @@ def process_daily_sales_inventory(self, processing_date_str=None):
                         StockMovement.objects.bulk_create(
                             stock_movements_to_create, batch_size=100
                         )
+                        stock_movements_created_total += len(stock_movements_to_create)
                         logger.info(
                             f"[process_daily_sales_inventory] CHUNK {chunk_num + 1}: "
                             f"LOAD: Created {len(stock_movements_to_create)} stock movements"
@@ -424,6 +593,46 @@ def process_daily_sales_inventory(self, processing_date_str=None):
             ]
         )
 
+        before_inventory_total = sum(
+            item["quantity_available"] for item in inventory_before_snapshot.values()
+        )
+        after_inventory_total = sum(
+            item["quantity_available"] for item in inventory_after_snapshot.values()
+        )
+        variant_changes = []
+        for variant_id, before_snapshot in inventory_before_snapshot.items():
+            after_snapshot = inventory_after_snapshot.get(variant_id, before_snapshot)
+            variant_changes.append(
+                {
+                    "sku": before_snapshot["sku"],
+                    "before": before_snapshot["quantity_available"],
+                    "after": after_snapshot["quantity_available"],
+                    "delta": after_snapshot["quantity_available"] - before_snapshot["quantity_available"],
+                }
+            )
+
+        variant_changes.sort(key=lambda item: item["sku"])
+
+        processing_finished_at = datetime.now()
+        comparison_report = {
+            "before": {
+                "status": previous_status,
+                "affected_inventory_total": before_inventory_total,
+                "stock_movements": existing_stock_movements,
+            },
+            "after": {
+                "status": processing_record.status,
+                "affected_inventory_total": after_inventory_total,
+                "stock_movements": existing_stock_movements + stock_movements_created_total,
+            },
+            "comparison": {
+                "inventory_delta": after_inventory_total - before_inventory_total,
+                "stock_movements_created": stock_movements_created_total,
+                "processing_time_ms": int((processing_finished_at - processing_started_at).total_seconds() * 1000),
+            },
+            "variant_changes": variant_changes,
+        }
+
         # ================================================================
         # RETURN SUMMARY
         # ================================================================
@@ -435,6 +644,7 @@ def process_daily_sales_inventory(self, processing_date_str=None):
             "processed_chunks": processed_chunks,
             "failed_chunks": len(failed_chunks_list),
             "failed_chunk_details": failed_chunks_list,
+            "comparison_report": comparison_report,
         }
 
     except Exception as e:

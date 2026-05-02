@@ -11,3 +11,6 @@ app.config_from_object("django.conf:settings", namespace="CELERY")
 
 # Automatically find tasks.py in all INSTALLED_APPS
 app.autodiscover_tasks()
+
+# Also discover batch task modules such as apps.orders.tasks_batch.
+app.autodiscover_tasks(related_name="tasks_batch")

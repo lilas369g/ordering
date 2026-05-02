@@ -1,6 +1,5 @@
 import time
 from celery import shared_task
-from celery.exceptions import MaxRetriesExceededError
 from celery.exceptions import Reject
 
 @shared_task(
