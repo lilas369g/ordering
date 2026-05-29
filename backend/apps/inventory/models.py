@@ -6,6 +6,15 @@ class InventoryRecord(TimeStampedModel):
     variant = models.OneToOneField('catalog.ProductVariant', on_delete=models.CASCADE, related_name='inventory_record')
     quantity_available = models.PositiveIntegerField(default=0)
     low_stock_threshold = models.PositiveIntegerField(default=0)
+    version = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(quantity_available__gte=0),
+                name='prevent_negative_stock' # منع المخزون السالب على مستوى الداتابيز
+            )
+        ]
 
     def __str__(self) -> str:
         return f'{self.variant.sku}: {self.quantity_available}'
