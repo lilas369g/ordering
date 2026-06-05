@@ -21,6 +21,7 @@ INSTALLED_APPS = [
     'rest_framework.authtoken',
     'drf_spectacular',
     'django_filters',
+    'corsheaders',
     'apps.common',
     'apps.users',
     'apps.customers',
@@ -36,6 +37,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -105,6 +107,14 @@ SPECTACULAR_SETTINGS = {
     'DESCRIPTION': 'Customer and admin REST APIs',
     'VERSION': '1.0.0',
 }
+
+# ---------------------------------------------------------
+# CORS (admin-web Vite dev server)
+# ---------------------------------------------------------
+CORS_ALLOWED_ORIGINS = [
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+]
 # ---------------------------------------------------------
 # CELERY CONFIGURATION
 # ---------------------------------------------------------
@@ -149,4 +159,13 @@ CELERY_TASK_DEFAULT_ROUTING_KEY = 'celery'
 CELERY_TASK_ACKS_LATE = True
 CELERY_BROKER_TRANSPORT_OPTIONS = {
     'visibility_timeout': 3600,  # 1 hour in seconds
+}
+# ---------------------------------------------------------
+# CACHE — Redis
+# ---------------------------------------------------------
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.redis.RedisCache",
+        "LOCATION": "redis://127.0.0.1:6379/1",
+    }
 }

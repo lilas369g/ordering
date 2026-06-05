@@ -24,6 +24,11 @@ class CustomerRegistrationSerializer(serializers.Serializer):
         return user
 
 
+class CustomerLoginSerializer(serializers.Serializer):
+    phone_number = serializers.CharField(max_length=20)
+    password = serializers.CharField(write_only=True)
+
+
 class CustomerProfileSerializer(serializers.ModelSerializer):
     phone_number = serializers.CharField(source='user.phone_number', read_only=True)
     first_name = serializers.CharField(source='user.first_name', read_only=True)

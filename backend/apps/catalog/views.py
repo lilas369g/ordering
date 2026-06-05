@@ -1,6 +1,8 @@
 from django.shortcuts import render
+import redis as redis_client
 from rest_framework import generics, permissions
 from rest_framework.response import Response # استيراد لاستخدامه في الكاش
+from django_redis import get_redis_connection
 from django.core.cache import cache # استيراد كاش Redis للطلب السادس
 from apps.cart.services import get_or_create_active_cart
 from .models import Product
@@ -27,7 +29,8 @@ class ProductListView(generics.ListAPIView):
             print("\n🔒 [Lock Attempt] Request trying to acquire lock for Product List...")
             
             # 2️⃣ تطبيق الـ Distributed Lock لمنع مشكلة الـ Cache Stampede عند التزامن العالي
-            with cache.lock(lock_key, timeout=10):
+            r = redis_client.Redis(host='127.0.0.1', port=6379, db=1)
+            with r.lock(lock_key, timeout=10):
                 # التثبت المزدوج (Double-Check) داخل القفل
                 cached_data = cache.get(cache_key)
                 

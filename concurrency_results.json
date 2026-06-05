@@ -1,0 +1,36 @@
+{
+  "last_updated": "2026-06-05T11:19:08.357706",
+  "num_users": 100,
+  "stock_per_run": 50,
+  "strategies": [
+    {
+      "name": "Pessimistic Locking",
+      "method": "select_for_update()",
+      "successful_orders": 50,
+      "failed_orders": 50,
+      "avg_latency_ms": 1831.5,
+      "throughput_orders_per_sec": 16.49,
+      "data_integrity": true
+    },
+    {
+      "name": "Optimistic Locking",
+      "method": "version field check",
+      "successful_orders": 50,
+      "failed_orders": 50,
+      "avg_latency_ms": 1620.9,
+      "throughput_orders_per_sec": 16.8,
+      "data_integrity": true
+    },
+    {
+      "name": "Atomic F() Expression",
+      "method": "F('quantity_available') - 1",
+      "successful_orders": 50,
+      "failed_orders": 50,
+      "avg_latency_ms": 1991.7,
+      "throughput_orders_per_sec": 13.6,
+      "data_integrity": true
+    }
+  ],
+  "winner": "Optimistic Locking",
+  "integrity_verified": true
+}

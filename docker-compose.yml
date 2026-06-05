@@ -1,0 +1,33 @@
+services:
+  django1:
+    build: .
+    ports:
+      - "8001:8000"
+    environment:
+      - DB_HOST=host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./backend/.env:/app/.env
+
+  django2:
+    build: .
+    ports:
+      - "8002:8000"
+    environment:
+      - DB_HOST=host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./backend/.env:/app/.env
+
+  django3:
+    build: .
+    ports:
+      - "8003:8000"
+    environment:
+      - DB_HOST=host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./backend/.env:/app/.env
