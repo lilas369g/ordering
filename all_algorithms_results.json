@@ -1,0 +1,40 @@
+{
+  "last_updated": "2026-06-05T00:00:00",
+  "algorithms": [
+    {
+      "name": "Single Worker", "label": "Baseline",
+      "catalog_mean": 1969, "catalog_p95": 2075, "catalog_max": 2188,
+      "checkout_mean": null, "checkout_p95": null,
+      "req_per_sec": 25.38, "wall_time": null,
+      "is_active": false, "recommended_for": "Development only"
+    },
+    {
+      "name": "Round Robin", "label": "",
+      "catalog_mean": 2241, "catalog_p95": 2347, "catalog_max": 3185,
+      "checkout_mean": 2848, "checkout_p95": 3343,
+      "req_per_sec": 28.36, "wall_time": 45.71,
+      "is_active": false, "recommended_for": "Uniform workload"
+    },
+    {
+      "name": "Least Connections", "label": "Active",
+      "catalog_mean": 2228, "catalog_p95": 2333, "catalog_max": 1958,
+      "checkout_mean": 2789, "checkout_p95": 3178,
+      "req_per_sec": 28.03, "wall_time": 45.07,
+      "is_active": true, "recommended_for": "Mixed workload (this project)"
+    },
+    {
+      "name": "IP Hash", "label": "",
+      "catalog_mean": 2213, "catalog_p95": 2333, "catalog_max": null,
+      "checkout_mean": 2789, "checkout_p95": 3548,
+      "req_per_sec": null, "wall_time": 44.98,
+      "is_active": false, "recommended_for": "Session persistence"
+    },
+    {
+      "name": "Weighted RR", "label": "",
+      "catalog_mean": 2218, "catalog_p95": 2357, "catalog_max": null,
+      "checkout_mean": 2776, "checkout_p95": 3235,
+      "req_per_sec": null, "wall_time": 45.15,
+      "is_active": false, "recommended_for": "Heterogeneous servers"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "last_updated": "2026-06-05T12:34:38.910265",
+  "total_requests": 2,
+  "cache_hits": 1,
+  "cache_misses": 1,
+  "hit_rate_percent": 50.0,
+  "avg_cache_latency_ms": 1.68,
+  "last_db_latency_ms": 248.33,
+  "speedup": 38.6,
+  "pattern": "Cache-Aside with Distributed Lock",
+  "lock_mechanism": "Redis Distributed Lock prevents Cache Stampede"
+}

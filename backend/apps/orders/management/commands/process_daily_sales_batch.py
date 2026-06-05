@@ -7,10 +7,16 @@ Usage:
     python manage.py process_daily_sales_batch 2026-05-01 --compare
 """
 
+import json
 import logging
 from datetime import datetime
+from pathlib import Path
 
 from django.core.management.base import BaseCommand, CommandError
+
+# Project root (…/ordering) — where benchmark result JSON files are written.
+PROJECT_ROOT = Path(__file__).resolve().parents[5]
+BATCH_RESULTS_PATH = PROJECT_ROOT / "batch_etl_results.json"
 
 from apps.inventory.models import DailySalesProcessing
 from apps.orders.models import Order, OrderStatus
@@ -236,6 +242,18 @@ class Command(BaseCommand):
                     f"   Stock Movements Match: {realtime_result.get('stock_movements_created', 0) == batch_after.get('stock_movements', 0)}"
                 )
 
+                self.save_compare_json(
+                    processing_date_value=processing_date_value,
+                    realtime_result=realtime_result,
+                    batch_result=batch_result,
+                    batch_after=batch_after,
+                    batch_comparison=batch_comparison,
+                    realtime_time=realtime_time,
+                    batch_time=batch_time,
+                    time_saved=time_saved,
+                    speedup=speedup,
+                )
+
                 self.stdout.write("\n✅ Comparison completed successfully.\n")
                 return
 
@@ -453,3 +471,54 @@ class Command(BaseCommand):
             )
             logger.exception("Error in process_daily_sales_batch command")
             raise CommandError(str(e))
+
+    def save_compare_json(
+        self,
+        processing_date_value,
+        realtime_result,
+        batch_result,
+        batch_after,
+        batch_comparison,
+        realtime_time,
+        batch_time,
+        time_saved,
+        speedup,
+    ):
+        realtime_delta = realtime_result.get("inventory_delta", 0)
+        batch_delta = batch_comparison.get("inventory_delta", 0)
+        realtime_movements = realtime_result.get("stock_movements_created", 0)
+        batch_movements = batch_after.get("stock_movements", 0)
+
+        output = {
+            "last_updated": datetime.now().isoformat(),
+            "processing_date": processing_date_value.isoformat(),
+            "total_orders": realtime_result.get("total_orders", 0),
+            "total_items": realtime_result.get("items_processed", 0),
+            "realtime": {
+                "label": "Real-Time Processing",
+                "processing_time_ms": realtime_time,
+                "status": "COMPLETED",
+                "orders_processed": realtime_result.get("orders_processed", 0),
+                "inventory_delta": realtime_delta,
+                "stock_movements": realtime_movements,
+            },
+            "batch": {
+                "label": "Batch ETL",
+                "processing_time_ms": batch_time,
+                "status": "COMPLETED",
+                "chunks_successful": batch_result.get("processed_chunks", 0),
+                "chunks_failed": batch_result.get("failed_chunks", 0),
+                "inventory_delta": batch_delta,
+                "stock_movements": batch_movements,
+            },
+            "comparison": {
+                "time_saved_ms": time_saved,
+                "speedup": speedup if speedup is not None else 0,
+                "inventory_match": realtime_delta == batch_delta,
+                "stock_movements_match": realtime_movements == batch_movements,
+            },
+        }
+
+        with open(BATCH_RESULTS_PATH, "w", encoding="utf-8") as handle:
+            json.dump(output, handle, indent=2, ensure_ascii=False)
+        self.stdout.write(f"Results saved to {BATCH_RESULTS_PATH}")

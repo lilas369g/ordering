@@ -1,0 +1,29 @@
+{
+  "last_updated": "2026-06-05T12:34:42.404959",
+  "processing_date": "2026-05-04",
+  "total_orders": 100,
+  "total_items": 500,
+  "realtime": {
+    "label": "Real-Time Processing",
+    "processing_time_ms": 1913,
+    "status": "COMPLETED",
+    "orders_processed": 100,
+    "inventory_delta": -500,
+    "stock_movements": 500
+  },
+  "batch": {
+    "label": "Batch ETL",
+    "processing_time_ms": 78,
+    "status": "COMPLETED",
+    "chunks_successful": 1,
+    "chunks_failed": 0,
+    "inventory_delta": -500,
+    "stock_movements": 500
+  },
+  "comparison": {
+    "time_saved_ms": 1835,
+    "speedup": 24.53,
+    "inventory_match": true,
+    "stock_movements_match": true
+  }
+}

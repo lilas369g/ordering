@@ -1,4 +1,7 @@
+import json
+from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from threading import Barrier, Thread
 from time import perf_counter
 from uuid import uuid4
@@ -16,6 +19,10 @@ from apps.orders.services import CheckoutError, checkout_cart
 from apps.users.models import UserType
 
 User = get_user_model()
+
+# Project root (…/ordering) — where benchmark result JSON files are written.
+PROJECT_ROOT = Path(__file__).resolve().parents[5]
+RESULTS_PATH = PROJECT_ROOT / "checkout_race_results.json"
 
 
 class Command(BaseCommand):
@@ -42,6 +49,44 @@ class Command(BaseCommand):
         metrics.append(self.run_strategy("CONDITIONAL_UPDATE", self.conditional_update_checkout))
 
         self.print_comparison(metrics)
+        self.save_results_json(metrics)
+
+    def save_results_json(self, metrics):
+        friendly_names = {
+            "UNSAFE": "Unsafe Read-Then-Write",
+            "ROW_LOCK": "Row Lock",
+            "CONDITIONAL_UPDATE": "Atomic Conditional Update",
+        }
+        strategies = []
+        for metric in metrics:
+            prefix = metric["prefix"]
+            strategies.append({
+                "name": friendly_names.get(prefix, prefix),
+                "method": self.strategy_method(prefix),
+                "status": self.strategy_status(metric),
+                "successes": metric["success_count"],
+                "failures": metric["failed_count"],
+                "orders": metric["orders"],
+                "oversold_units": metric["oversold_units"],
+                "duration_ms": metric["duration_ms"],
+                "safe": metric["oversold_units"] == 0,
+            })
+
+        output = {
+            "last_updated": datetime.now().isoformat(),
+            "scenario": {
+                "initial_stock": self.initial_stock,
+                "parallel_checkouts": self.worker_count,
+                "quantity_per_checkout": 1,
+            },
+            "strategies": strategies,
+            "winner": friendly_names["CONDITIONAL_UPDATE"],
+            "lesson": "Atomic conditional UPDATE prevents oversell without explicit locks",
+        }
+
+        with open(RESULTS_PATH, "w", encoding="utf-8") as handle:
+            json.dump(output, handle, indent=2, ensure_ascii=False)
+        self.stdout.write(f"\nResults saved to {RESULTS_PATH}")
 
     def run_strategy(self, prefix, checkout_func):
         variant, users = self.create_race_data(prefix, stock=self.initial_stock)

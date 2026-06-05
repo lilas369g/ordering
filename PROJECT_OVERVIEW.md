@@ -95,61 +95,117 @@ Used as hands-on implementation for an 8-session Parallel Programming Course.
 ## Running the Project
 
 ### Prerequisites
-1. PostgreSQL 18 running (max_connections=200)
-2. Memurai (Redis) running on port 6379
-3. Python venv activated
+1. PostgreSQL 18 running with max_connections=200
+   - To set: `psql -U postgres -c "ALTER SYSTEM SET max_connections = 200;"`
+   - Then restart PostgreSQL service
+2. Memurai (Redis-compatible) running on port 6379
+   - Location: `C:\Program Files\Memurai\memurai.exe`
+   - Start: Run as service (already installed)
+   - Verify: `memurai-cli ping` → PONG
+3. Python venv activated:
+   ```
+   cd "C:\Users\AlaaH\parallel pro\ordering"
+   .venv\Scripts\activate
+   ```
 
-### Start Backend
+### Start Backend (Development)
 ```
 cd backend
-.venv\Scripts\activate   (Windows)
 python manage.py runserver
 ```
+→ http://127.0.0.1:8000
 
-### Start Load Balancer (Session 5)
-Terminals 1-3: Waitress workers
-```
-python -m waitress --port=8001 --threads=4 config.wsgi:application
-python -m waitress --port=8002 --threads=4 config.wsgi:application
-python -m waitress --port=8003 --threads=4 config.wsgi:application
-```
-Terminal 4: Nginx
-```
-C:\nginx\nginx.exe
-```
-
-### Start Celery Worker (Sessions 3, 4)
-```
-celery -A config worker -l info -P solo --without-mingle --without-gossip
-```
-
-### Admin Dashboard
+### Start Admin Dashboard
 ```
 cd admin-web
 npm install
 npm run dev
 ```
 → http://localhost:5173
+Login: phone=0911000001, password=Test@1234
 
-### Run All Benchmarks
-Session 2
+### Start Load Balancer Setup (Session 5)
+```
+# Terminal 1
+python -m waitress --port=8001 --threads=4 config.wsgi:application
+# Terminal 2
+python -m waitress --port=8002 --threads=4 config.wsgi:application
+# Terminal 3
+python -m waitress --port=8003 --threads=4 config.wsgi:application
+# Terminal 4 (run as Administrator)
+C:\nginx\nginx.exe
+# Switch algorithm
+python switch_algorithm.py  # interactive menu
+```
+
+### Start Celery Worker (Session 3 & 4)
+```
+celery -A config worker -l info -P solo --without-mingle --without-gossip
+```
+Note: Requires RabbitMQ running (Session 3 only)
+
+### Run Benchmarks Manually
+
+#### Session 1 — Race Conditions
+```
+python manage.py simulate_checkout_race
+# Saves: checkout_race_results.json
+```
+
+#### Session 2 — Thread Pool
 ```
 python manage.py simulate_external_service_thread_pool
+# Saves: thread_pool_results.json
 ```
-Session 4
+
+#### Session 3 — Async Queue (requires RabbitMQ + Celery)
+```
+python manage.py simulate_async_queue
+```
+
+#### Session 4 — Batch ETL
 ```
 python manage.py seed_batch_demo_orders
 python manage.py process_daily_sales_batch 2026-05-04 --compare
+# Saves: batch_etl_results.json
+# To re-run: python manage.py reset_daily_sales_processing 2026-05-04
 ```
-Session 7
+
+#### Session 5 — Load Balancing
+```
+# Run with Nginx + 3 Waitress workers active
+python benchmark_mixed.py
+# Results are static in: all_algorithms_results.json
+```
+
+#### Session 6 — Redis Cache
+```
+# Auto-updates on every catalog API request
+curl http://127.0.0.1:8000/api/v1/catalog/products/
+# Or run the test script:
+python test_caching_6.py
+# Saves: cache_results.json
+```
+
+#### Session 7 — Concurrency Control
 ```
 cd backend
 python test_concurrency.py
+# Saves: concurrency_results.json
 ```
-Session 6 (auto) — just call the API
+
+### Performance Dashboard API
 ```
-curl http://localhost:8000/api/v1/catalog/products/
+GET  /api/v1/admin/performance-data/          → all benchmark results
+POST /api/v1/admin/run-benchmark/{session}/   → trigger benchmark (sessions: thread_pool, batch_etl, concurrency, checkout_race)
+GET  /api/v1/admin/benchmark-status/{session}/ → check if running
 ```
+
+### Known Issues & Fixes
+- Windows console encoding: run with `PYTHONUTF8=1` prefix if emoji causes errors
+- PostgreSQL "too many clients": ensure max_connections=200 is set
+- Redis RESP3 error: redis-py must be <5 (pinned to `redis>=4.6,<5` in requirements.txt)
+- Memurai PATH: add `C:\Program Files\Memurai` to PATH for redis-cli commands
 
 ## Key Implementation Decisions
 - Waitress over Gunicorn: Docker/WSL2 failed on Windows
@@ -157,3 +213,8 @@ curl http://localhost:8000/api/v1/catalog/products/
 - `CONN_SEMAPHORE(30)`: prevents PostgreSQL "too many clients" in stress tests
 - Least Connections: best for mixed catalog GETs + checkout POSTs
 - `max_connections=200`: increased from 100 for 100-thread concurrency tests
+
+## Run admin-web
+-cd "C:\Users\AlaaH\parallel pro\ordering\admin-web"
+-npm run dev
+visit Local:   http://localhost:5173/

@@ -1,8 +1,15 @@
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
 from threading import Lock, Thread, current_thread
 from time import perf_counter, sleep
 
 from django.core.management.base import BaseCommand
+
+# Project root (…/ordering) — where benchmark result JSON files are written.
+PROJECT_ROOT = Path(__file__).resolve().parents[5]
+RESULTS_PATH = PROJECT_ROOT / "thread_pool_results.json"
 
 
 class Command(BaseCommand):
@@ -35,6 +42,45 @@ class Command(BaseCommand):
         ]
 
         self.print_final_comparison(metrics)
+        self.save_results_json(metrics)
+
+    def save_results_json(self, metrics):
+        friendly_names = {
+            "SEQUENTIAL_TOO_SLOW": "Sequential",
+            "THREAD_PER_CALL_RISKY": "Thread Per Call",
+            "THREAD_POOL_BALANCED": "Thread Pool Balanced",
+            "THREAD_POOL_TOO_HIGH": "Thread Pool Too High",
+        }
+        strategies = []
+        for metric in metrics:
+            name = metric["strategy"]
+            strategies.append({
+                "name": friendly_names.get(name, name),
+                "label": self.strategy_status(metric),
+                "successful_orders": metric["successful_count"],
+                "failed_orders": metric["failed_count"],
+                "duration_ms": round(metric["total_duration_ms"], 2),
+                "throughput_orders_per_sec": round(metric["throughput"], 2),
+                "created_threads": metric["created_threads"],
+                "overload_events": metric["overload_events"],
+                "recommended": name == "THREAD_POOL_BALANCED",
+            })
+
+        output = {
+            "last_updated": datetime.now().isoformat(),
+            "scenario": {
+                "pending_orders": self.order_count,
+                "external_service_capacity": self.safe_external_service_capacity,
+                "external_call_ms": self.external_call_ms,
+            },
+            "strategies": strategies,
+            "winner": "Thread Pool Balanced",
+            "lesson": "Pool size = external service capacity. More threads = more failures.",
+        }
+
+        with open(RESULTS_PATH, "w", encoding="utf-8") as handle:
+            json.dump(output, handle, indent=2, ensure_ascii=False)
+        self.stdout.write(f"\nResults saved to {RESULTS_PATH}")
 
     def run_sequential_too_slow(self):
         strategy = "SEQUENTIAL_TOO_SLOW"
